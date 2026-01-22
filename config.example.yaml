@@ -1,0 +1,44 @@
+# Volumetric Pipeline Configuration
+# ==================================
+# Copy this file and modify for your dataset.
+
+# Data Source
+# -----------
+zarr_url: "https://lsp-public-data.s3.amazonaws.com/biomedvis-challenge-2025/Dataset1-LSP13626-melanoma-in-situ/0"
+zarr_component: "0"  # Resolution level: "0" = full, "1" = 2x downsample, "2" = 4x, etc.
+
+# Channels
+# --------
+# Specify channel indices to process, or omit/set to null for all channels.
+# At least 2 channels required for overlap analysis.
+channels: [0, 1, 2]
+# channels: null  # Process all channels
+
+# Thresholding
+# ------------
+# Available methods:
+#   - percentile_95, percentile_90, percentile_99
+#   - otsu (automatic)
+#   - mean_2std, mean_3std
+threshold_method: "percentile_95"
+
+# Only used if threshold_method is percentile-based
+threshold_percentile: 95.0
+
+# Tiling
+# ------
+# Tile size in pixels. Set to null for automatic calculation based on available memory.
+tile_size: null  # Auto-calculate
+
+# Memory settings for automatic tile size calculation
+available_memory_gb: 8.0   # RAM/VRAM to use
+memory_safety_factor: 0.5  # Use 50% of available memory
+
+# Output
+# ------
+output_dir: "./results"
+save_masks: false  # Save binary masks as TIFFs (can be large!)
+
+# Execution
+# ---------
+resume: true  # Resume from checkpoint if interrupted

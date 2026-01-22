@@ -54,7 +54,7 @@ docs = [
 ]
 
 [project.scripts]
-bioset-preprocessing = "bioset_preprocessing.cli:main"
+bioset = "bioset_preprocessing.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Chahat08/BioSET_Preprocessing.git" 
