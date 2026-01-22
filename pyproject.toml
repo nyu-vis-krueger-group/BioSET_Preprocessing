@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "BioSET_Preprocessing"
+version = "0.1.0"
+description = "A pipeline for processing multivolumetric microscopy data to generate files needed for the BioSET web viewer."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Chahat Kalsi", email = "chahat.kalsi@nyu.edu"},
+]
+keywords = ["microscopy", "volumetric", "image-processing", "zarr", "dask"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    "numpy>=1.21",
+    "dask[array]>=2023.0",
+    "zarr>=2.0",
+    "ome-zarr>=0.8",
+    "fsspec>=2023.0",
+    "aiohttp>=3.8",
+    "pyyaml>=6.0",
+    "tifffile>=2023.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x>=12.0",  # For CUDA 12.x, users can also use cupy-cuda11x
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+docs = [
+    "sphinx>=6.0",
+    "sphinx-rtd-theme>=1.0",
+]
+
+[project.scripts]
+bioset-preprocessing = "bioset_preprocessing.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Chahat08/BioSET_Preprocessing.git" 
+Documentation = "https://github.com/Chahat08/BioSET_Preprocessing.git#readme"
+Repository = "https://github.com/Chahat08/BioSET_Preprocessing"
+Issues = "https://github.com/Chahat08/BioSET_Preprocessing/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bioset_preprocessing"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]  # Line too long (handled by black)
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_ignores = true
