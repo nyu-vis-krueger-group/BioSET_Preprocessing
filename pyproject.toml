@@ -39,7 +39,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = [
-    "cupy-cuda12x>=12.0",  # For CUDA 12.x, users can also use cupy-cuda11x
+    "cupy-cuda13x>=13.0",  # For CUDA 13.x (requires Python <=3.13)
 ]
 dev = [
     "pytest>=7.0",
