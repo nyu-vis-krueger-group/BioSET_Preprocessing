@@ -93,8 +93,12 @@ def save_raw_tiff(
 
 def generate_tile_filename(
     channel: int,
-    tile_y: int,
     tile_x: int,
+    tile_x_start: int, 
+    tile_x_end: int,
+    tile_y: int,
+    tile_y_start: int, 
+    tile_y_end: int,
     suffix: str = "mask",
     method: Optional[str] = None,
     extension: str = ".tiff",
@@ -106,6 +110,10 @@ def generate_tile_filename(
         channel: Channel index
         tile_y: Tile Y index
         tile_x: Tile X index
+        tile_x_start: Tile X start coordinate
+        tile_x_end: Tile X end coordinate
+        tile_y_start: Tile Y start coordinate
+        tile_y_end: Tile Y end coordinate
         suffix: File suffix (e.g., "mask", "raw")
         method: Threshold method name (optional)
         extension: File extension
@@ -121,6 +129,8 @@ def generate_tile_filename(
         f"ch{channel:02d}",
         f"tile_y{tile_y:02d}",
         f"x{tile_x:02d}",
+        f"xstart{tile_x_start}_xend{tile_x_end}",
+        f"ystart{tile_y_start}_yend{tile_y_end}"
     ]
     
     if method:

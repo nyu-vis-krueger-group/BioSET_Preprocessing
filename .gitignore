@@ -13,6 +13,10 @@
 .vscode/
 .vs/
 .venv
+*.tiff
+*.csv
+*.json
+notebooks/test_results
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs

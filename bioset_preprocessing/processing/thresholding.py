@@ -6,7 +6,8 @@ Supports GPU acceleration via CuPy when available.
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
+# from skimage.filters import threshold_otsu as sk_threshold_otsu
 
 import numpy as np
 
@@ -114,7 +115,7 @@ def threshold_percentile(
     )
 
 
-def threshold_otsu(data: np.ndarray) -> ThresholdResult:
+def threshold_otsu(data: np.ndarray, nbins: Optional[int] = None) -> ThresholdResult:
     """
     Otsu's automatic thresholding.
     
@@ -123,37 +124,32 @@ def threshold_otsu(data: np.ndarray) -> ThresholdResult:
     
     Args:
         data: Input array (any shape)
+        nbins: Number of bins for histogram (default: 256)
     
     Returns:
         ThresholdResult with binary mask and metadata
     """
-    # Flatten data for histogram
-    flat = data.ravel().astype(np.float64)
+    _init_gpu()
     
-    # Compute histogram with 256 bins
-    hist, bin_edges = np.histogram(flat, bins=256)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    if nbins is None:
+        dtype_str = str(data.dtype)
+        if data.dtype == np.uint16 or dtype_str in ('>u2', '<u2'):
+            nbins = 65536  # 16 bit full precision
+        elif data.dtype == np.uint8:
+            nbins = 256
+        else:
+            nbins = 4096  # default
     
-    # Cumulative sums and means
-    weight1 = np.cumsum(hist).astype(np.float64)
-    weight2 = np.cumsum(hist[::-1])[::-1].astype(np.float64)
+    if _GPU_AVAILABLE:
+        thresh = _otsu_threshold_gpu(data, nbins)
+        data_gpu = _cp.asarray(data)
+        mask = _cp.asnumpy(data_gpu > thresh).astype(np.uint8)
+        del data_gpu
+        _cp.get_default_memory_pool().free_all_blocks()
+    else:
+        thresh = _otsu_threshold_cpu(data, nbins)
+        mask = (data > thresh).astype(np.uint8)
     
-    # Avoid division by zero
-    weight1 = np.maximum(weight1, 1)
-    weight2 = np.maximum(weight2, 1)
-    
-    mean1 = np.cumsum(hist * bin_centers) / weight1
-    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / weight2[::-1])[::-1]
-    
-    # Inter-class variance
-    variance = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
-    
-    # Find optimal threshold
-    idx = np.argmax(variance)
-    thresh = float(bin_centers[idx])
-    
-    # Apply threshold
-    mask = (data > thresh).astype(np.uint8)
     active = int(np.sum(mask))
     
     return ThresholdResult(
@@ -163,6 +159,87 @@ def threshold_otsu(data: np.ndarray) -> ThresholdResult:
         active_fraction=active / mask.size,
         method="otsu",
     )
+
+def _otsu_threshold_cpu(data: np.ndarray, nbins: int) -> float:
+    """
+    Compute Otsu threshold on CPU.
+    
+    Uses histogram-based approach for efficiency.
+    """
+    data_min = float(np.min(data))
+    data_max = float(np.max(data))
+    
+    if data_min == data_max:
+        return data_min
+    
+    hist, bin_edges = np.histogram(data.ravel(), bins=nbins, range=(data_min, data_max))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    hist = hist.astype(np.float64)
+    hist_norm = hist / hist.sum()
+    
+    weight1 = np.cumsum(hist_norm)               
+    weight2 = np.cumsum(hist_norm[::-1])[::-1]   
+    
+    mean1 = np.cumsum(hist_norm * bin_centers)   
+    mean2 = np.cumsum((hist_norm * bin_centers)[::-1])[::-1]  
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mean1 = np.where(weight1 > 0, mean1 / weight1, 0)
+        mean2 = np.where(weight2 > 0, mean2 / weight2, 0)
+    
+    variance_between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    
+    variance_between = np.nan_to_num(variance_between, nan=0.0)
+
+    idx = np.argmax(variance_between)
+    thresh = float(bin_centers[idx])
+    
+    return thresh
+
+
+def _otsu_threshold_gpu(data: np.ndarray, nbins: int) -> float:
+    """
+    Compute Otsu threshold on GPU using CuPy.
+    
+    Accelerates histogram computation and variance calculation.
+    """
+    data_gpu = _cp.asarray(data.ravel())
+    
+    data_min = float(_cp.min(data_gpu))
+    data_max = float(_cp.max(data_gpu))
+    
+    if data_min == data_max:
+        del data_gpu
+        _cp.get_default_memory_pool().free_all_blocks()
+        return data_min
+    
+    hist, bin_edges = _cp.histogram(data_gpu, bins=nbins, range=(data_min, data_max))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    del data_gpu
+    
+    hist = hist.astype(_cp.float64)
+    hist_norm = hist / hist.sum()
+
+    weight1 = _cp.cumsum(hist_norm)
+    weight2 = _cp.cumsum(hist_norm[::-1])[::-1]
+    
+    mean1 = _cp.cumsum(hist_norm * bin_centers)
+    mean2 = _cp.cumsum((hist_norm * bin_centers)[::-1])[::-1]
+    mean1 = _cp.where(weight1 > 0, mean1 / weight1, 0)
+    mean2 = _cp.where(weight2 > 0, mean2 / weight2, 0)
+
+    variance_between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    variance_between = _cp.nan_to_num(variance_between, nan=0.0)
+    idx = int(_cp.argmax(variance_between))
+    thresh = float(bin_centers[idx])
+    
+    # Cleanup
+    del hist, bin_edges, bin_centers, hist_norm
+    del weight1, weight2, mean1, mean2, variance_between
+    _cp.get_default_memory_pool().free_all_blocks()
+    
+    return thresh
 
 
 def threshold_mean_std(

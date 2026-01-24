@@ -298,8 +298,12 @@ class Pipeline:
             if self.config.save_masks:
                 mask_path = self.config.output_dir / generate_tile_filename(
                     channel=channel,
-                    tile_y=tile.tile_y,
                     tile_x=tile.tile_x,
+                    tile_x_start=tile.x_start,
+                    tile_x_end=tile.x_end,
+                    tile_y=tile.tile_y,
+                    tile_y_start=tile.y_start,
+                    tile_y_end=tile.y_end,
                     suffix="mask",
                     method=self.config.threshold_method,
                 )
@@ -312,12 +316,12 @@ class Pipeline:
         
         # Save overlaps
         saver.save_overlaps(
-            tile_y=tile.tile_y,
             tile_x=tile.tile_x,
-            y_start=tile.y_start,
-            y_end=tile.y_end,
             x_start=tile.x_start,
             x_end=tile.x_end,
+            tile_y=tile.tile_y,
+            y_start=tile.y_start,
+            y_end=tile.y_end,
             overlap_result=overlap_result,
         )
         
