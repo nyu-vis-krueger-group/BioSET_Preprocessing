@@ -220,17 +220,24 @@ class Pipeline:
         
         # Setup
         output_dir = Path(self.config.output_dir)
-        saver = ResultSaver(output_dir, channels)
+        saver = ResultSaver(
+            output_dir, 
+            channels,
+            max_channels_in_comb=self.config.max_num_channels_in_comb
+        )
         checkpoint = CheckpointManager(output_dir)
         
         # Ensure data and tiling are ready
         _ = self.tiling_scheme
         
         n_tiles = self.tiling_scheme.total_tiles
-        channel_combos = get_channel_combinations(channels)
+        channel_combos = get_channel_combinations(
+            channels, 
+            max_size=self.config.max_num_channels_in_comb
+        )
         
         logger.info(f"Tiles: {n_tiles}")
-        logger.info(f"Channel combinations: {len(channel_combos)}")
+        logger.info(f"Channel combinations: {len(channel_combos)} (max {self.config.max_num_channels_in_comb} channels)")
         
         # Process tiles
         completed = 0
@@ -362,35 +369,36 @@ class Pipeline:
             del tile_data
         
         # Determine dilation radii
-        dilation_radii = self.config.dilation_radii_um or [0]  # Default: no dilation
+        dilation_radii = self.config.dilation_radii_um or [0]
         if 0 not in dilation_radii:
-            dilation_radii = [0] + list(dilation_radii)  # Always include 0
+            dilation_radii = [0] + list(dilation_radii)
         
-        # Process each dilation radius
+        # Pre-compute distance transforms ONCE per channel (only if dilation needed)
+        distance_transforms = {}
+        if any(r > 0 for r in dilation_radii):
+            from .processing import compute_distance_transform
+            
+            logger.debug("  Computing distance transforms...")
+            for channel, mask in masks.items():
+                distance_transforms[channel] = compute_distance_transform(mask, spacing_um)
+        
+        # Process each dilation radius (now fast - just thresholding)
         for radius_um in dilation_radii:
             if radius_um == 0:
-                # No dilation - use original masks
                 dilated_masks = masks
             else:
-                # Dilate each mask
-                from .processing import compute_distance_transform, dilate_from_distance_transform
+                from .processing import dilate_from_distance_transform
                 
                 dilated_masks = {}
                 for channel, mask in masks.items():
-                    # Compute distance transform
-                    distances = compute_distance_transform(mask, spacing_um)
-                    # Dilate
                     dilated_masks[channel] = dilate_from_distance_transform(
-                        distances, mask, radius_um
+                        distance_transforms[channel], mask, radius_um
                     )
-                    del distances
-                
-                logger.debug(f"  Dilated masks by {radius_um} μm")
             
             # Compute overlaps
             overlap_result = compute_overlaps(dilated_masks)
             
-            # Save overlaps (with dilation suffix if applicable)
+            # Save overlaps
             saver.save_overlaps_with_dilation(
                 tile_x=tile.tile_x,
                 x_start=tile.x_start,
@@ -402,16 +410,11 @@ class Pipeline:
                 dilation_radius_um=radius_um if radius_um > 0 else None,
             )
             
-            # Log overlap summary
-            suffix = f" (dilation={radius_um}μm)" if radius_um > 0 else ""
-            for combo, count in overlap_result.overlaps.items():
-                combo_str = "+".join(map(str, combo))
-                logger.debug(f"  Overlap {combo_str}{suffix}: {count:,}")
-            
-            # Free dilated masks if they were newly created
             if radius_um > 0:
                 del dilated_masks
         
+        # Free distance transforms
+        del distance_transforms
         del masks
     
     # def _process_tile(

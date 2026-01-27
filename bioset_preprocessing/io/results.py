@@ -40,12 +40,16 @@ class ResultSaver:
         self,
         output_dir: Path,
         channels: List[int],
+        max_channels_in_comb: int = 4,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.channels = channels
-        self.channel_combinations = get_channel_combinations(channels)
+        self.channel_combinations = get_channel_combinations(
+            channels, 
+            max_size=max_channels_in_comb
+        )
         
         self.thresholds_path = self.output_dir / "thresholds.csv"
         self.overlaps_path = self.output_dir / "overlaps.csv"

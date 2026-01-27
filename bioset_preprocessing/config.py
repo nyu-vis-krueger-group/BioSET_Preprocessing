@@ -78,6 +78,9 @@ class Config:
     # Dilation (optional) - list of radii in micrometers, None means no dilation
     dilation_radii_um: Optional[List[float]] = None  # e.g., [0, 1, 3] or None
     
+    # Overlap computation
+    max_num_channels_in_comb: int = 4  # Maximum number of channels in a combination
+    
     def __post_init__(self):
         """Validate and normalize configuration after initialization."""
         if isinstance(self.output_dir, str):

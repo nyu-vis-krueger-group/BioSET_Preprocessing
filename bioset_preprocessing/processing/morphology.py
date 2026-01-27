@@ -89,6 +89,7 @@ def filter_connected_components(
     
     try:
         import cc3d
+        logger.debug("Using cc3d for connected component analysis")
         labels, n_components = cc3d.connected_components(
             binary_mask, 
             connectivity=connectivity,
@@ -196,6 +197,8 @@ def compute_distance_transform(
     Returns distance from each background voxel to nearest foreground voxel.
     Can be reused for multiple dilation radii.
     
+    Uses GPU acceleration via CuPy when available.
+    
     Args:
         mask: Binary mask (Z, Y, X)
         spacing_um: Voxel spacing (Z, Y, X) in micrometers
@@ -203,12 +206,40 @@ def compute_distance_transform(
     Returns:
         Distance array (float32) in micrometers
     """
-    from scipy.ndimage import distance_transform_edt
+    _init_gpu()
     
     binary_mask = (mask > 0).astype(np.uint8)
     
     if np.sum(binary_mask) == 0:
         return np.full(mask.shape, np.inf, dtype=np.float32)
+    
+    if _GPU_AVAILABLE:
+        try:
+            from cupyx.scipy.ndimage import distance_transform_edt as gpu_edt
+            
+            mask_gpu = _cp.asarray(binary_mask == 0)
+            
+            distances_gpu = gpu_edt(
+                mask_gpu,
+                sampling=spacing_um,
+                return_distances=True,
+                return_indices=False,
+                float64_distances=False,
+            )
+            
+            distances = _cp.asnumpy(distances_gpu).astype(np.float32)
+            
+            del mask_gpu, distances_gpu
+            _cp.get_default_memory_pool().free_all_blocks()
+            
+            logger.debug("Distance transform computed on GPU")
+            return distances
+            
+        except Exception as e:
+            logger.warning(f"GPU distance transform failed, falling back to CPU: {e}")
+    
+    # CPU fallback using scipy
+    from scipy.ndimage import distance_transform_edt
     
     distances = distance_transform_edt(
         binary_mask == 0,
