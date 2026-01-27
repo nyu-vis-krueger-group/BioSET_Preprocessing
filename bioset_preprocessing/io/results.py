@@ -8,7 +8,7 @@ import csv
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from ..processing.overlap import OverlapResult, get_channel_combinations
 
@@ -140,6 +140,89 @@ class ResultSaver:
         with open(self.overlaps_path, "a", newline="") as f:
             writer = csv.writer(f)
             # Get counts in same order as header
+            counts = [
+                overlap_result.overlaps.get(combo, 0)
+                for combo in self.channel_combinations
+            ]
+            writer.writerow([
+                tile_y, tile_x,
+                y_start, y_end, x_start, x_end,
+                datetime.now().isoformat()
+            ] + counts)
+    
+    def get_overlaps_path(self, dilation_radius_um: Optional[float] = None) -> Path:
+        """
+        Get path for overlaps CSV file.
+        
+        Args:
+            dilation_radius_um: Dilation radius, or None for base overlaps
+            
+        Returns:
+            Path to CSV file
+        """
+        if dilation_radius_um is None or dilation_radius_um == 0:
+            return self.overlaps_path
+        else:
+            return self.output_dir / f"overlaps_dilation_{dilation_radius_um}um.csv"
+    
+    def init_overlaps_file(self, dilation_radius_um: Optional[float] = None) -> Path:
+        """
+        Initialize an overlaps CSV file with headers.
+        
+        Args:
+            dilation_radius_um: Dilation radius for filename
+            
+        Returns:
+            Path to the initialized file
+        """
+        path = self.get_overlaps_path(dilation_radius_um)
+        
+        if not path.exists():
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                combo_cols = [
+                    "_".join(map(str, combo)) 
+                    for combo in self.channel_combinations
+                ]
+                writer.writerow([
+                    "tile_y", "tile_x",
+                    "y_start", "y_end", "x_start", "x_end",
+                    "timestamp"
+                ] + combo_cols)
+            logger.info(f"Created {path}")
+        
+        return path
+    
+    def save_overlaps_with_dilation(
+        self,
+        tile_y: int,
+        tile_x: int,
+        y_start: int,
+        y_end: int,
+        x_start: int,
+        x_end: int,
+        overlap_result: "OverlapResult",
+        dilation_radius_um: Optional[float] = None,
+    ) -> None:
+        """
+        Save overlap results for a tile, optionally with dilation suffix.
+        
+        Args:
+            tile_y: Tile Y index
+            tile_x: Tile X index
+            y_start, y_end: Y slice bounds
+            x_start, x_end: X slice bounds
+            overlap_result: OverlapResult from compute_overlaps()
+            dilation_radius_um: Dilation radius (None or 0 for base)
+        """
+        path = self.get_overlaps_path(dilation_radius_um)
+        
+        # Ensure file is initialized
+        if not path.exists():
+            self.init_overlaps_file(dilation_radius_um)
+        
+        with open(path, "a", newline="") as f:
+            writer = csv.writer(f)
             counts = [
                 overlap_result.overlaps.get(combo, 0)
                 for combo in self.channel_combinations

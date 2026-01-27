@@ -47,11 +47,9 @@ class Config:
         ... )
     """
     
-    # Data source
     zarr_url: str
     zarr_component: str = "0"
     
-    # Processing parameters
     channels: Optional[List[int]] = None  # None means all channels
     threshold_method: ThresholdMethod = "percentile_95"
     threshold_percentile: float = 95.0  # Used for percentile methods
@@ -69,14 +67,22 @@ class Config:
     
     # Execution
     resume: bool = True
+
+    # Metadata
+    metadata_url: Optional[str] = None  # URL to OME-XML, auto-inferred if None
+    
+    # Connected Component Filtering (optional)
+    cc_filter_enabled: bool = False
+    cc_min_volume_um3: float = 0.8  # Minimum component volume in cubic micrometers
+    
+    # Dilation (optional) - list of radii in micrometers, None means no dilation
+    dilation_radii_um: Optional[List[float]] = None  # e.g., [0, 1, 3] or None
     
     def __post_init__(self):
         """Validate and normalize configuration after initialization."""
-        # Convert output_dir to Path if string
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
         
-        # Validate threshold method
         valid_methods = [
             "percentile_95", "percentile_90", "percentile_99",
             "otsu", "mean_2std", "mean_3std"
@@ -87,11 +93,9 @@ class Config:
                 f"Must be one of: {valid_methods}"
             )
         
-        # Validate percentile
         if self.threshold_percentile < 0 or self.threshold_percentile > 100:
             raise ValueError("threshold_percentile must be between 0 and 100")
         
-        # Validate channels if provided
         if self.channels is not None:
             if not isinstance(self.channels, list):
                 raise ValueError("channels must be a list of integers")
@@ -185,6 +189,10 @@ class Config:
             "output_dir": str(self.output_dir),
             "save_masks": self.save_masks,
             "resume": self.resume,
+            "metadata_url": self.metadata_url,
+            "cc_filter_enabled": self.cc_filter_enabled,
+            "cc_min_volume_um3": self.cc_min_volume_um3,
+            "dilation_radii_um": self.dilation_radii_um,
         }
     
     def __repr__(self) -> str:

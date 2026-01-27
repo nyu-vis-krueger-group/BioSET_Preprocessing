@@ -15,6 +15,14 @@ from .thresholding import (
 )
 from .tiling import TileInfo, TilingScheme, calculate_optimal_tile_size, create_tiling_scheme
 
+from .morphology import (
+    CCFilterResult,
+    filter_connected_components,
+    dilate_mask,
+    compute_distance_transform,
+    dilate_from_distance_transform,
+)
+
 __all__ = [
     # Tiling
     "TileInfo",
@@ -37,4 +45,10 @@ __all__ = [
     "compute_overlaps",
     "compute_pairwise_matrix",
     "get_channel_combinations",
+    # Morphology
+    "CCFilterResult",
+    "filter_connected_components",
+    "dilate_mask",
+    "compute_distance_transform",
+    "dilate_from_distance_transform",
 ]

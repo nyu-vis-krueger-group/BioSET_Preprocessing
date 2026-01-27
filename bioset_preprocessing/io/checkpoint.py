@@ -46,6 +46,7 @@ class CheckpointManager:
     def _load(self) -> Set[Tuple[int, int]]:
         """Load completed tiles from checkpoint file."""
         if not self.checkpoint_path.exists():
+            self.stage_completion = {}  # ADD THIS
             return set()
         
         try:
@@ -54,18 +55,32 @@ class CheckpointManager:
             
             # Convert lists back to tuples for set
             tiles = set(tuple(t) for t in data.get("completed_tiles", []))
+            
+            # ADD THIS: Load stage completion
+            self.stage_completion = {}
+            for tile_key, stages in data.get("stage_completion", {}).items():
+                self.stage_completion[tile_key] = set(stages)
+            
             logger.info(f"Loaded checkpoint: {len(tiles)} tiles completed")
             return tiles
         
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"Could not load checkpoint: {e}")
+            self.stage_completion = {}  # ADD THIS
             return set()
     
     def _save(self) -> None:
         """Save checkpoint to file."""
+        # Convert stage_completion sets to lists for JSON
+        stage_completion_json = {}
+        if hasattr(self, 'stage_completion'):
+            for tile_key, stages in self.stage_completion.items():
+                stage_completion_json[tile_key] = list(stages)
+        
         data = {
             "completed_tiles": [list(t) for t in sorted(self.completed_tiles)],
             "total_completed": len(self.completed_tiles),
+            "stage_completion": stage_completion_json,  # ADD THIS
             "last_updated": datetime.now().isoformat(),
         }
         
@@ -95,6 +110,43 @@ class CheckpointManager:
         """
         self.completed_tiles.add((tile_y, tile_x))
         self._save()
+
+    def mark_stage_completed(self, tile_y: int, tile_x: int, stage: str) -> None:
+        """
+        Mark a specific stage as completed for a tile.
+        
+        Args:
+            tile_y: Tile Y index
+            tile_x: Tile X index
+            stage: Stage name (e.g., 'threshold', 'cc_filter', 'dilation_0', 'dilation_5')
+        """
+        tile_key = f"{tile_y},{tile_x}"
+        if not hasattr(self, 'stage_completion'):
+            self.stage_completion = {}
+        
+        if tile_key not in self.stage_completion:
+            self.stage_completion[tile_key] = set()
+        
+        self.stage_completion[tile_key].add(stage)
+        self._save()
+    
+    def is_stage_completed(self, tile_y: int, tile_x: int, stage: str) -> bool:
+        """
+        Check if a specific stage is completed for a tile.
+        
+        Args:
+            tile_y: Tile Y index
+            tile_x: Tile X index
+            stage: Stage name
+            
+        Returns:
+            True if stage is completed
+        """
+        if not hasattr(self, 'stage_completion'):
+            return False
+        
+        tile_key = f"{tile_y},{tile_x}"
+        return tile_key in self.stage_completion and stage in self.stage_completion[tile_key]
     
     def reset(self) -> None:
         """Clear all checkpoint data."""

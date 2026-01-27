@@ -35,6 +35,9 @@ dependencies = [
     "aiohttp>=3.8",
     "pyyaml>=6.0",
     "tifffile>=2023.0",
+    "ome-types>=0.6.3",
+    "requests>=2.28",
+    "cc3d>=3.10"
 ]
 
 [project.optional-dependencies]
