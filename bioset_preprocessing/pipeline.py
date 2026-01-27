@@ -26,6 +26,8 @@ from .processing import (
     dilate_from_distance_transform,
 )
 
+import time
+
 logger = logging.getLogger(__name__)
 
 
@@ -285,6 +287,14 @@ class Pipeline:
         saver: ResultSaver,
     ) -> None:
         """Process a single tile: threshold, optionally filter CC, optionally dilate, compute overlaps."""
+        t_start = time.time()
+        t_load_total = 0
+        t_thresh_total = 0
+        t_cc_total = 0
+        t_dilation_total = 0
+        t_overlap_total = 0
+        t_save_total = 0
+        
         masks = {}
         
         # Get physical dimensions for CC filtering and dilation
@@ -301,6 +311,8 @@ class Pipeline:
         
         # Process each channel
         for channel in channels:
+            t0 = time.time()
+
             # Load tile data
             tile_data = get_tile_data(
                 self.array,
@@ -309,9 +321,13 @@ class Pipeline:
                 y_slice=tile.y_slice,
                 x_slice=tile.x_slice,
             )
+
+            t_load_total += time.time() - t0
             
             # Apply threshold
+            t0 = time.time()
             result = apply_threshold(tile_data, self.config.threshold_method)
+            t_thresh_total += time.time() - t0
             mask = result.mask
             
             # Save threshold result
@@ -335,13 +351,13 @@ class Pipeline:
             
             # Optional: Connected component filtering
             if self.config.cc_filter_enabled:
-                from .processing import filter_connected_components
-                
+                t0 = time.time()                
                 cc_result = filter_connected_components(
                     mask=mask,
                     min_volume_um3=self.config.cc_min_volume_um3,
                     voxel_volume_um3=voxel_volume_um3,
                 )
+                t_cc_total += time.time() - t0
                 mask = cc_result.mask
                 
                 logger.debug(
@@ -374,31 +390,34 @@ class Pipeline:
             dilation_radii = [0] + list(dilation_radii)
         
         # Pre-compute distance transforms ONCE per channel (only if dilation needed)
+        t0 = time.time()
         distance_transforms = {}
         if any(r > 0 for r in dilation_radii):
-            from .processing import compute_distance_transform
-            
             logger.debug("  Computing distance transforms...")
             for channel, mask in masks.items():
                 distance_transforms[channel] = compute_distance_transform(mask, spacing_um)
+        t_dt_total = time.time() - t0
         
-        # Process each dilation radius (now fast - just thresholding)
+        # Process each dilation radius 
         for radius_um in dilation_radii:
+            t0 = time.time()
             if radius_um == 0:
                 dilated_masks = masks
             else:
-                from .processing import dilate_from_distance_transform
-                
                 dilated_masks = {}
                 for channel, mask in masks.items():
                     dilated_masks[channel] = dilate_from_distance_transform(
                         distance_transforms[channel], mask, radius_um
                     )
+            t_dilation_total += time.time() - t0
             
             # Compute overlaps
+            t0 = time.time()
             overlap_result = compute_overlaps(dilated_masks)
+            t_overlap_total = time.time() - t0
             
             # Save overlaps
+            t0 = time.time()
             saver.save_overlaps_with_dilation(
                 tile_x=tile.tile_x,
                 x_start=tile.x_start,
@@ -409,95 +428,29 @@ class Pipeline:
                 overlap_result=overlap_result,
                 dilation_radius_um=radius_um if radius_um > 0 else None,
             )
+            t_save_total += time.time() - t0
+
+            # Log overlaps
+            suffix = f" (dilation={radius_um}μm)" if radius_um > 0 else ""
+            for combo, count in overlap_result.overlaps.items():
+                combo_str = "+".join(map(str, combo))
+                logger.debug(f"  Overlap {combo_str}{suffix}: {count:,}")
             
             if radius_um > 0:
                 del dilated_masks
+        
+        t_total = time.time() - t_start
+    
+        logger.info(
+            f"  Tile timing: load={t_load_total:.1f}s, thresh={t_thresh_total:.1f}s, "
+            f"cc={t_cc_total:.1f}s, dt={t_dt_total:.1f}s, dilate={t_dilation_total:.1f}s, "
+            f"overlap={t_overlap_total:.1f}s, save={t_save_total:.1f}s, total={t_total:.1f}s"
+        )
         
         # Free distance transforms
         del distance_transforms
         del masks
     
-    # def _process_tile(
-    #     self,
-    #     tile,
-    #     channels: List[int],
-    #     saver: ResultSaver,
-    # ) -> None:
-    #     """Process a single tile: threshold all channels and compute overlaps."""
-    #     masks = {}
-        
-    #     # Process each channel
-    #     for channel in channels:
-    #         # Load tile data
-    #         tile_data = get_tile_data(
-    #             self.array,
-    #             self.array_info,
-    #             channel=channel,
-    #             y_slice=tile.y_slice,
-    #             x_slice=tile.x_slice,
-    #         )
-            
-    #         # Apply threshold
-    #         result = apply_threshold(tile_data, self.config.threshold_method)
-    #         masks[channel] = result.mask
-            
-    #         # Save threshold result
-    #         saver.save_threshold(
-    #             tile_y=tile.tile_y,
-    #             tile_x=tile.tile_x,
-    #             channel=channel,
-    #             threshold=result.threshold_value,
-    #             active_voxels=result.active_voxels,
-    #             active_fraction=result.active_fraction,
-    #             y_start=tile.y_start,
-    #             y_end=tile.y_end,
-    #             x_start=tile.x_start,
-    #             x_end=tile.x_end,
-    #         )
-            
-    #         logger.debug(
-    #             f"  Ch {channel}: thresh={result.threshold_value:.2f}, "
-    #             f"active={result.active_fraction:.2%}"
-    #         )
-            
-    #         # Optionally save mask
-    #         if self.config.save_masks:
-    #             mask_path = self.config.output_dir / generate_tile_filename(
-    #                 channel=channel,
-    #                 tile_x=tile.tile_x,
-    #                 tile_x_start=tile.x_start,
-    #                 tile_x_end=tile.x_end,
-    #                 tile_y=tile.tile_y,
-    #                 tile_y_start=tile.y_start,
-    #                 tile_y_end=tile.y_end,
-    #                 suffix="mask",
-    #                 method=self.config.threshold_method,
-    #             )
-    #             save_mask_tiff(result.mask, mask_path)
-            
-    #         del tile_data
-        
-    #     # Compute overlaps
-    #     overlap_result = compute_overlaps(masks)
-        
-    #     # Save overlaps
-    #     saver.save_overlaps(
-    #         tile_x=tile.tile_x,
-    #         x_start=tile.x_start,
-    #         x_end=tile.x_end,
-    #         tile_y=tile.tile_y,
-    #         y_start=tile.y_start,
-    #         y_end=tile.y_end,
-    #         overlap_result=overlap_result,
-    #     )
-        
-    #     # Log overlap summary
-    #     for combo, count in overlap_result.overlaps.items():
-    #         combo_str = "+".join(map(str, combo))
-    #         logger.debug(f"  Overlap {combo_str}: {count:,}")
-        
-    #     del masks
-
 
 def run_pipeline(
     config: Optional[Config] = None,
