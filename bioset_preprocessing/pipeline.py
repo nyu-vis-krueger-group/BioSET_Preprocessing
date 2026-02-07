@@ -6,6 +6,7 @@ and result saving.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -419,15 +420,30 @@ class Pipeline:
         
         # ----------------------------------------------------------
         # Stage 2: Distance transforms (once, reused for all radii)
+        #          Parallelized — scipy releases the GIL
         # ----------------------------------------------------------
         distance_transforms = {}
         if any(r > 0 for r in dilation_radii):
             with profiler.stage("distance_transform"):
-                for channel, mask in masks.items():
-                    if np.any(mask):
-                        distance_transforms[channel] = compute_distance_transform(
-                            mask, spacing_um
-                        )
+                # Only compute for non-empty masks
+                channels_to_compute = [
+                    ch for ch, mask in masks.items() if np.any(mask)
+                ]
+                
+                n_workers = min(len(channels_to_compute), os.cpu_count() or 4)
+                
+                def _dt_worker(ch):
+                    return ch, compute_distance_transform(masks[ch], spacing_um)
+                
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    for ch, dt in pool.map(_dt_worker, channels_to_compute):
+                        distance_transforms[ch] = dt
+                
+                logger.debug(
+                    f"  Distance transforms: {len(distance_transforms)} channels, "
+                    f"{n_workers} threads"
+                )
         
         # ----------------------------------------------------------
         # Stage 3: Per-dilation overlap analysis
