@@ -430,20 +430,21 @@ class Pipeline:
                     ch for ch, mask in masks.items() if np.any(mask)
                 ]
                 
-                n_workers = min(len(channels_to_compute), os.cpu_count() or 4)
+                if channels_to_compute:
+                    n_workers = min(len(channels_to_compute), os.cpu_count() or 4)
+                    
+                    def _dt_worker(ch):
+                        return ch, compute_distance_transform(masks[ch], spacing_um)
+                    
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                        for ch, dt in pool.map(_dt_worker, channels_to_compute):
+                            distance_transforms[ch] = dt
                 
-                def _dt_worker(ch):
-                    return ch, compute_distance_transform(masks[ch], spacing_um)
-                
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    for ch, dt in pool.map(_dt_worker, channels_to_compute):
-                        distance_transforms[ch] = dt
-                
-                logger.debug(
-                    f"  Distance transforms: {len(distance_transforms)} channels, "
-                    f"{n_workers} threads"
-                )
+                    logger.debug(
+                        f"  Distance transforms: {len(distance_transforms)} channels, "
+                        f"{n_workers} threads"
+                    )
         
         # ----------------------------------------------------------
         # Stage 3: Per-dilation overlap analysis
