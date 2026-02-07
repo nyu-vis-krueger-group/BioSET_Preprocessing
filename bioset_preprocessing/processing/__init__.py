@@ -1,6 +1,15 @@
 """Processing utilities for thresholding, tiling, and overlap computation."""
 
-from .overlap import OverlapResult, compute_overlaps, compute_pairwise_matrix, get_channel_combinations
+from .overlap import (
+    OverlapResult,
+    PairwiseResult,
+    EnrichmentResult,
+    HigherOrderResult,
+    compute_overlaps,
+    compute_all_overlaps,
+    compute_pairwise_fast,
+    get_channel_combinations,
+)
 from .thresholding import (
     ThresholdResult,
     apply_threshold,
@@ -42,8 +51,12 @@ __all__ = [
     "is_gpu_available",
     # Overlap
     "OverlapResult",
+    "PairwiseResult",
+    "EnrichmentResult",
+    "HigherOrderResult",
     "compute_overlaps",
-    "compute_pairwise_matrix",
+    "compute_all_overlaps",
+    "compute_pairwise_fast",
     "get_channel_combinations",
     # Morphology
     "CCFilterResult",

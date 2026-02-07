@@ -80,6 +80,8 @@ class Config:
     
     # Overlap computation
     max_num_channels_in_comb: int = 4  # Maximum number of channels in a combination
+    enrichment_threshold: float = 2.0  # Min pairwise enrichment for higher-order combos
+    hierarchy_levels: int = 3  # Number of spatial hierarchy levels (0 = no aggregation)
     
     def __post_init__(self):
         """Validate and normalize configuration after initialization."""
