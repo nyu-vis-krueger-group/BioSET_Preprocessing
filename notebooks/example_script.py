@@ -32,8 +32,8 @@ def get_unique_channels(metadata_url: str) -> dict[int, str]:
 
 
 def main():
-    metadata_url = "https://lsp-public-data.s3.amazonaws.com/biomedvis-challenge-2025/Dataset1-LSP13626-melanoma-in-situ/OME/METADATA.ome.xml"
-    zarr_url = "https://lsp-public-data.s3.amazonaws.com/biomedvis-challenge-2025/Dataset1-LSP13626-melanoma-in-situ/0"
+    metadata_url = "https://lsp-public-data.s3.amazonaws.com/biomedvis-challenge-2025/Dataset1-LSP13626-invasive-margin/OME/METADATA.ome.xml"
+    zarr_url = "https://lsp-public-data.s3.amazonaws.com/biomedvis-challenge-2025/Dataset1-LSP13626-invasive-margin/0"
 
     unique_channels = get_unique_channels(metadata_url)
     print(f"Found {len(unique_channels)} unique channels: {unique_channels}")
@@ -41,7 +41,8 @@ def main():
     config = Config(
         zarr_url=zarr_url,
         metadata_url=metadata_url,
-        channels=list(unique_channels.keys()),
+        # channels=list(unique_channels.keys()),
+        channels=[0,1,2,3,4],
         max_num_channels_in_comb=4,
         enrichment_threshold=2.0,
         tile_size=256,
@@ -51,7 +52,7 @@ def main():
         cc_filter_enabled=True,
         cc_min_volume_um3=0.8,
         dilation_radii_um=[0, 1, 2, 3, 4, 5],
-        hierarchy_levels=3,  # 0,1,2,3
+        hierarchy_levels=4,  # 0,1,2,3
     )
 
     pipeline = Pipeline(config)

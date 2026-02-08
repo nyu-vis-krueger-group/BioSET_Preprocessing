@@ -230,7 +230,6 @@ def compute_distance_transform(
             distances = _cp.asnumpy(distances_gpu).astype(np.float32)
             
             del mask_gpu, distances_gpu
-            _cp.get_default_memory_pool().free_all_blocks()
             
             logger.debug("Distance transform computed on GPU")
             return distances

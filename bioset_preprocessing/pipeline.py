@@ -327,70 +327,84 @@ class Pipeline:
         dilation_radii: List[float],
     ) -> None:
         """
-        Process a single tile:
-        1. Load + threshold + CC filter each channel
-        2. Write per-channel stats
-        3. Compute distance transforms
-        4. For each dilation: overlap analysis + enrichment + write
+        Process a single tile with parallelized stages:
+        1. Parallel load all channels from S3 (overlaps network waits)
+        2. Parallel threshold + CC filter (uses all CPU cores)
+        3. Write per-channel stats
+        4. Parallel distance transforms
+        5. For each dilation: overlap analysis + enrichment + write
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        masks = {}
-        
-        # Total voxels in this tile (computed from first channel load)
-        tile_total_voxels = None
+        n_workers = min(len(channels), os.cpu_count() or 4)
         
         # ----------------------------------------------------------
-        # Stage 1: Load, threshold, CC filter each channel
+        # Stage 1: Parallel S3 load (network-bound — threading helps)
         # ----------------------------------------------------------
-        for channel in channels:
-            
-            # ---- Load ----
-            with profiler.stage("load"):
-                tile_data = get_tile_data(
+        raw_data = {}
+        with profiler.stage("load"):
+            def _load_channel(ch):
+                return ch, get_tile_data(
                     self.array, self.array_info,
-                    channel=channel,
-                    y_slice=tile.y_slice,
-                    x_slice=tile.x_slice,
+                    channel=ch, y_slice=tile.y_slice, x_slice=tile.x_slice,
                 )
             
-            if tile_total_voxels is None:
-                tile_total_voxels = tile_data.size
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_load_channel, ch): ch for ch in channels}
+                for future in as_completed(futures):
+                    ch, data = future.result()
+                    raw_data[ch] = data
+        
+        tile_total_voxels = raw_data[channels[0]].size
+        
+        # ----------------------------------------------------------
+        # Stage 2: Parallel threshold + CC filter (CPU-bound, GIL-free)
+        # ----------------------------------------------------------
+        masks = {}
+        channel_stats = {}  # ch -> (threshold_result, mean_int, max_int)
+        
+        def _process_channel(ch):
+            """Threshold + CC filter one channel."""
+            data = raw_data[ch]
+            mean_intensity = float(np.mean(data))
+            max_intensity = float(np.max(data))
             
-            # ---- Intensity stats (before threshold) ----
-            with profiler.stage("intensity_stats"):
-                mean_intensity = float(np.mean(tile_data))
-                max_intensity = float(np.max(tile_data))
-            
-            # ---- Threshold ----
-            with profiler.stage("threshold"):
-                result = apply_threshold(tile_data, self.config.threshold_method)
-            
+            result = apply_threshold(data, self.config.threshold_method)
             mask = result.mask
             
-            # ---- CC Filtering ----
             if self.config.cc_filter_enabled:
-                with profiler.stage("cc_filter"):
-                    cc_result = filter_connected_components(
-                        mask=mask,
-                        min_volume_um3=self.config.cc_min_volume_um3,
-                        voxel_volume_um3=voxel_volume_um3,
-                    )
-                    mask = cc_result.mask
-                    logger.debug(
-                        f"  Ch {channel}: CC {cc_result.original_components}"
-                        f" -> {cc_result.remaining_components} components"
-                    )
+                cc_result = filter_connected_components(
+                    mask=mask,
+                    min_volume_um3=self.config.cc_min_volume_um3,
+                    voxel_volume_um3=voxel_volume_um3,
+                )
+                mask = cc_result.mask
             
-            masks[channel] = mask
-            
-            # ---- Write channel stats to bioset ----
-            with profiler.stage("write"):
+            return ch, mask, result, mean_intensity, max_intensity
+        
+        with profiler.stage("threshold_and_cc"):
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_process_channel, ch): ch for ch in channels}
+                for future in as_completed(futures):
+                    ch, mask, result, mean_int, max_int = future.result()
+                    masks[ch] = mask
+                    channel_stats[ch] = (result, mean_int, max_int)
+        
+        # Free raw data — we only need masks from here
+        del raw_data
+        
+        # ----------------------------------------------------------
+        # Stage 2b: Write channel stats (fast, sequential is fine)
+        # ----------------------------------------------------------
+        with profiler.stage("write"):
+            for ch in channels:
+                result, mean_intensity, max_intensity = channel_stats[ch]
                 writer.write_channel_stat(
                     tile_x0=tile.x_start, tile_x1=tile.x_end,
                     tile_y0=tile.y_start, tile_y1=tile.y_end,
                     hierarchy_level=0,
-                    channel=channel_names[channel],
-                    channel_idx=channel,
+                    channel=channel_names[ch],
+                    channel_idx=ch,
                     threshold_value=result.threshold_value,
                     active_voxels=result.active_voxels,
                     active_fraction=result.active_fraction,
@@ -398,53 +412,35 @@ class Pipeline:
                     mean_intensity=mean_intensity,
                     max_intensity=max_intensity,
                 )
-            
-            logger.debug(
-                f"  Ch {channel} ({channel_names[channel]}): "
-                f"thresh={result.threshold_value:.2f}, "
-                f"active={result.active_fraction:.2%}, "
-                f"mean_int={mean_intensity:.1f}"
-            )
-            
-            # ---- Optional: save mask TIFF ----
-            if self.config.save_masks:
-                mask_path = self.config.output_dir / generate_tile_filename(
-                    channel=channel,
-                    tile_x=tile.tile_x, tile_x_start=tile.x_start, tile_x_end=tile.x_end,
-                    tile_y=tile.tile_y, tile_y_start=tile.y_start, tile_y_end=tile.y_end,
-                    suffix="mask", method=self.config.threshold_method,
-                )
-                save_mask_tiff(mask, mask_path)
-            
-            del tile_data
+                
+                if self.config.save_masks:
+                    mask_path = self.config.output_dir / generate_tile_filename(
+                        channel=ch,
+                        tile_x=tile.tile_x, tile_x_start=tile.x_start, tile_x_end=tile.x_end,
+                        tile_y=tile.tile_y, tile_y_start=tile.y_start, tile_y_end=tile.y_end,
+                        suffix="mask", method=self.config.threshold_method,
+                    )
+                    save_mask_tiff(masks[ch], mask_path)
+        
+        del channel_stats
         
         # ----------------------------------------------------------
-        # Stage 2: Distance transforms (once, reused for all radii)
-        #          Parallelized — scipy releases the GIL
+        # Stage 3: Distance transforms (parallel, scipy releases GIL)
         # ----------------------------------------------------------
         distance_transforms = {}
         if any(r > 0 for r in dilation_radii):
             with profiler.stage("distance_transform"):
-                # Only compute for non-empty masks
                 channels_to_compute = [
                     ch for ch, mask in masks.items() if np.any(mask)
                 ]
                 
                 if channels_to_compute:
-                    n_workers = min(len(channels_to_compute), os.cpu_count() or 4)
-                    
                     def _dt_worker(ch):
                         return ch, compute_distance_transform(masks[ch], spacing_um)
                     
-                    from concurrent.futures import ThreadPoolExecutor
                     with ThreadPoolExecutor(max_workers=n_workers) as pool:
                         for ch, dt in pool.map(_dt_worker, channels_to_compute):
                             distance_transforms[ch] = dt
-                
-                    logger.debug(
-                        f"  Distance transforms: {len(distance_transforms)} channels, "
-                        f"{n_workers} threads"
-                    )
         
         # ----------------------------------------------------------
         # Stage 3: Per-dilation overlap analysis

@@ -99,7 +99,6 @@ def threshold_percentile(
         thresh = float(_cp.percentile(data_gpu, percentile))
         mask = _cp.asnumpy(data_gpu > thresh).astype(np.uint8)
         del data_gpu
-        _cp.get_default_memory_pool().free_all_blocks()
     else:
         thresh = float(np.percentile(data, percentile))
         mask = (data > thresh).astype(np.uint8)
@@ -145,7 +144,6 @@ def threshold_otsu(data: np.ndarray, nbins: Optional[int] = None) -> ThresholdRe
         data_gpu = _cp.asarray(data)
         mask = _cp.asnumpy(data_gpu > thresh).astype(np.uint8)
         del data_gpu
-        _cp.get_default_memory_pool().free_all_blocks()
     else:
         thresh = _otsu_threshold_cpu(data, nbins)
         mask = (data > thresh).astype(np.uint8)
@@ -210,7 +208,6 @@ def _otsu_threshold_gpu(data: np.ndarray, nbins: int) -> float:
     
     if data_min == data_max:
         del data_gpu
-        _cp.get_default_memory_pool().free_all_blocks()
         return data_min
     
     hist, bin_edges = _cp.histogram(data_gpu, bins=nbins, range=(data_min, data_max))
@@ -237,7 +234,6 @@ def _otsu_threshold_gpu(data: np.ndarray, nbins: int) -> float:
     # Cleanup
     del hist, bin_edges, bin_centers, hist_norm
     del weight1, weight2, mean1, mean2, variance_between
-    _cp.get_default_memory_pool().free_all_blocks()
     
     return thresh
 
