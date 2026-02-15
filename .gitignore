@@ -17,6 +17,7 @@
 *.csv
 *.json
 notebooks/test_results
+data/
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs

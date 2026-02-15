@@ -1,25 +1,43 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import os
 from typing import Dict, List, Optional, Tuple
-
+import zarr
 import dask.array as da
 from ome_zarr.io import parse_url  
 
+def _is_remote_location(loc: str) -> bool:
+    return loc.startswith(("http://", "https://", "s3://", "gs://"))
+
+def _open_store(location: str):
+    if _is_remote_location(location):
+        root = parse_url(location, mode="r")
+        return root.store
+    if not os.path.exists(location):
+        raise FileNotFoundError(f"Local zarr path not found: {location}")
+    return zarr.NestedDirectoryStore(location)  
+
 @dataclass
 class ZarrPyramid:
-    url: str
+    location: str
     arrays: Dict[str, da.Array]  
 
     @staticmethod
-    def open(url: str, components: Optional[List[str]] = None) -> "ZarrPyramid":
-        root = parse_url(url, mode="r")
-        store = root.store
+    def open(location: str, components: Optional[List[str]] = None) -> "ZarrPyramid":
+        store = _open_store(location)
+        arrays: Dict[str, da.Array] = {}
+
+        try:
+            A_root = da.from_zarr(store)  
+            arrays["root"] = A_root
+            return ZarrPyramid(location=location, arrays=arrays)
+        except Exception:
+            pass
 
         # If components not provided, try 0..6
         if components is None:
             components = [str(i) for i in range(7)]
 
-        arrays: Dict[str, da.Array] = {}
         for c in components:
             try:
                 arrays[c] = da.from_zarr(store, component=c)
@@ -27,8 +45,8 @@ class ZarrPyramid:
                 pass
 
         if not arrays:
-            raise RuntimeError(f"No readable zarr components found at {url}")
-        return ZarrPyramid(url=url, arrays=arrays)
+            raise RuntimeError(f"No readable zarr components found at {location}")
+        return ZarrPyramid(location=location, arrays=arrays)
 
     def highest_res(self) -> Tuple[str, da.Array]:
         # assume "0" is highest if present; else pick max shape

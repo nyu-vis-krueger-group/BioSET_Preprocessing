@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Union
+from typing import Sequence, Tuple, Optional
 
 @dataclass(frozen=True)
 class VoxelSizeUM:
@@ -15,9 +15,10 @@ class VoxelSizeUM:
 
 @dataclass
 class PipelineConfig:
-    zarr_url: str
-    metadata_url: str
-    channels: Sequence[int]  
+    zarr_url: str | None = None     # remote
+    zarr_path: str | None = None    # local
+    metadata_url: str = ""
+    channels: Sequence[int]  = ()
 
     tile_xy: Tuple[int, int] = (128, 128)   # (tile_y, tile_x)
     channel_batch: int = 8                  # how many channels per batch

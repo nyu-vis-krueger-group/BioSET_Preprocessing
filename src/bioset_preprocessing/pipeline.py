@@ -27,13 +27,47 @@ def chunked(seq: Sequence[int], k: int) -> Iterator[List[int]]:
 class Pipeline:
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
-        self.pyr = ZarrPyramid.open(cfg.zarr_url)
 
-        self.comp_hi, self.A_hi = self.pyr.highest_res()
-        if self.pyr.is_multiplexed() and cfg.prefer_lowest_res_for_global:
-            self.comp_lo, self.A_lo = self.pyr.lowest_res()
+        self.pyr_local = ZarrPyramid.open(cfg.zarr_path) if cfg.zarr_path else None
+        self.pyr_remote = ZarrPyramid.open(cfg.zarr_url) if cfg.zarr_url else None
+
+        if not self.pyr_local and not self.pyr_remote:
+            raise ValueError("Provide at least one of zarr_path (local) or zarr_url (remote).")
+
+        def has_multi(pyr: ZarrPyramid) -> bool:
+            return len(pyr.arrays) > 1
+
+        if self.pyr_local:
+            self.comp_hi, self.A_hi = self.pyr_local.highest_res()
+            hi_source = "local"
         else:
-            self.comp_lo, self.A_lo = self.comp_hi, self.A_hi
+            self.comp_hi, self.A_hi = self.pyr_remote.highest_res()
+            hi_source = "remote"
+
+        
+        if self.pyr_local and has_multi(self.pyr_local):
+            self.comp_lo, self.A_lo = self.pyr_local.lowest_res()
+            global_source = "local(lowest)"
+        elif self.pyr_local and not has_multi(self.pyr_local):
+            if self.pyr_remote and has_multi(self.pyr_remote):
+                self.comp_lo, self.A_lo = self.pyr_remote.lowest_res()
+                global_source = "remote(lowest)"
+            elif self.pyr_remote:
+                self.comp_lo, self.A_lo = self.pyr_remote.highest_res()
+                global_source = "remote(highest)"
+            else:
+                self.comp_lo, self.A_lo = self.comp_hi, self.A_hi
+                global_source = f"{hi_source}(highest)"
+        else:
+            if has_multi(self.pyr_remote):
+                self.comp_lo, self.A_lo = self.pyr_remote.lowest_res()
+                global_source = "remote(lowest)"
+            else:
+                self.comp_lo, self.A_lo = self.pyr_remote.highest_res()
+                global_source = "remote(highest)"
+
+        print(f"[Pipeline] HI source: {hi_source} component={self.comp_hi} shape={self.A_hi.shape}", flush=True)
+        print(f"[Pipeline] GLOBAL source: {global_source} component={self.comp_lo} shape={self.A_lo.shape}", flush=True)
 
         self.th = AlphaThreshold(alpha=cfg.alpha, trim_q=cfg.trim_q)
         self.cc = ConnectedComponentsFilter(

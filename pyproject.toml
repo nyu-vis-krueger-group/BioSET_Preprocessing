@@ -30,10 +30,15 @@ dependencies = [
     "numpy",
     "scipy",
     "dask[array]",
-    "zarr",
+    "zarr==2.18.7",
     "ome-zarr",
     "matplotlib",
     "cupy"
+]
+
+[project.optional-dependencies]
+rechunk = [
+    "rechunker==0.5.4",
 ]
 
 [project.scripts]
