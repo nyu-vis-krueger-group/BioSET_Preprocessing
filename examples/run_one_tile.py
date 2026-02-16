@@ -45,7 +45,7 @@ pipe = Pipeline(cfg)
 pipe.compute_global_thresholds()
 
 # iterate a few outputs
-for i, out in enumerate(pipe.iter_tile_outputs()):
+for i, out in enumerate(pipe.iter_tile_overlap_outputs()):
     # mempool = cp.get_default_memory_pool()
     # gpu_mb = mempool.used_bytes() / 1e6
     # print(f"[GPU: {gpu_mb:.1f}MB] ch={out.channel} tile={out.tile} t={out.threshold.t_final:.1f} cc={out.cc.n_components} masks={list(out.masks.keys())}")

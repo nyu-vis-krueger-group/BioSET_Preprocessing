@@ -11,6 +11,7 @@ from .tiling import iter_tiles_xy, tile_slices, TileIndex
 from .stages.threshold import AlphaThreshold, ThresholdStats
 from .stages.cc_filter import ConnectedComponentsFilter, CCStats
 from .stages.dilation import EDTSweepDilation, DilationResult
+from .stages.overlaps import OverlapTileResult, OverlapMiner
 
 @dataclass
 class TileOutput:
@@ -81,6 +82,15 @@ class Pipeline:
             float64_distances=cfg.float64_distances,  
         )
 
+        self.overlap_miner = OverlapMiner(
+            radii_um=cfg.dilate_um,
+            max_set_size=cfg.max_set_size,
+            min_marker_vox=cfg.min_marker_vox,
+            min_support_pair=cfg.min_support_pair,
+            min_support_set=cfg.min_support_set,
+            aggressive_stop_on_fail=cfg.aggressive_stop_on_fail,
+        )
+
         self._t_global: Dict[int, float] = {}
 
     def compute_global_thresholds(self) -> Dict[int, float]:
@@ -119,3 +129,41 @@ class Pipeline:
                         cc=ccstats,
                         masks=dilres.dilated,
                     )
+
+    def iter_tile_overlap_outputs(self) -> Iterator[OverlapTileResult]:
+        if not self._t_global:
+            self.compute_global_thresholds()
+
+        _, _, z, y, x = self.A_hi.shape
+        tile_y, tile_x = self.cfg.tile_xy
+        radii = sorted(float(r) for r in self.cfg.dilate_um)
+
+        for tile in iter_tiles_xy(y, x, tile_y=tile_y, tile_x=tile_x):
+            ys, xs = tile_slices(tile, tile_y, tile_x)
+
+            masks: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
+            marker_vox: Dict[float, Dict[int, int]] = {r: {} for r in radii}
+
+            for ch_batch in chunked(self.cfg.channels, self.cfg.channel_batch):
+                vol_cpu = self.A_hi[0, ch_batch, :, ys, xs].compute()
+                vol_gpu = cp.asarray(vol_cpu)
+
+                for i, ch in enumerate(ch_batch):
+                    v = vol_gpu[i]
+                    tstats = self.th.compute_tile_gpu(v, self._t_global[ch])
+                    mask0 = self.th.apply_gpu(v, tstats.t_final)
+                    mask1, _ = self.cc(mask0)
+                    
+                    dilres: DilationResult = self.dil(mask1)
+
+                    for r in radii:
+                        m = dilres.dilated[r]
+                        masks[r][ch] = m
+                        marker_vox[r][ch] = int(cp.count_nonzero(m))
+
+            yield self.overlap_miner.run(
+                tile_x=tile.tx,
+                tile_y=tile.ty,
+                masks=masks,
+                marker_vox=marker_vox,
+            )

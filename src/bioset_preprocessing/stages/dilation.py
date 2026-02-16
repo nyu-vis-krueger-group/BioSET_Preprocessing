@@ -16,6 +16,10 @@ class EDTSweepDilation:
         self.float64_distances = float64_distances
 
     def __call__(self, mask_gpu: cp.ndarray) -> DilationResult:
+        if int(cp.count_nonzero(mask_gpu)) == 0:
+            dilated = {r: cp.zeros_like(mask_gpu, dtype=cp.bool_) for r in self.radii_um}
+            return DilationResult(dist_um=None, dilated=dilated)
+    
         dist = distance_transform_edt(~mask_gpu, sampling=self.sampling, float64_distances=self.float64_distances)
         if dist.dtype != cp.float32 and not self.float64_distances:
             dist = dist.astype(cp.float32)

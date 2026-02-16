@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Optional
+from typing import Sequence, Tuple, Dict
 
 @dataclass(frozen=True)
 class VoxelSizeUM:
@@ -34,3 +34,10 @@ class PipelineConfig:
 
     prefer_lowest_res_for_global: bool = True
     float64_distances: bool = False      # for edt   
+
+    # Overlaps
+    max_set_size: int = 5
+    min_marker_vox: Dict[float, int] | int = 0      # per dilation radius or single value
+    min_support_pair: Dict[float, int] | int = 0    # min intersection for pairs
+    min_support_set: Dict[float, int] | int = 0     # min intersection for k>=3
+    aggressive_stop_on_fail: bool = True            # stop at smaller radii if fails

@@ -22,7 +22,6 @@ def main():
     run.add_argument("--zarr-path", help="Local OME-Zarr root directory (e.g. /scratch/.../rechunked.zarr)")
     run.add_argument("--meta", required=True, help="OME-XML metadata URL")
 
-    run.add_argument("--meta", required=True, help="OME-XML metadata URL (used for voxel sizes, etc.)")
     run.add_argument("--channels", required=True, help="Comma-separated channel indices, e.g. 0,3,39")
     run.add_argument("--tile", default="128", help="Tile size: N or NyxNx, e.g. 128 or 128x256")
     run.add_argument("--batch", type=int, default=8, help="Channels per batch on GPU")
