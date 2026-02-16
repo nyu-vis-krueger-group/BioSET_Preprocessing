@@ -1,7 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, Iterator, Sequence, List
+from typing import Dict, Iterator, Sequence, List, Set, Tuple
 from pathlib import Path
+import time
 
 import numpy as np
 import cupy as cp
@@ -13,6 +14,12 @@ from .stages.threshold import AlphaThreshold, ThresholdStats
 from .stages.cc_filter import ConnectedComponentsFilter, CCStats
 from .stages.dilation import EDTSweepDilation, DilationResult
 from .stages.overlaps import OverlapTileResult, OverlapMiner
+from .checkpoint import (
+    save_tile_checkpoint, 
+    get_completed_tiles, 
+    load_all_checkpoints,
+    get_checkpoint_stats,
+)
 
 @dataclass
 class TileOutput:
@@ -131,7 +138,107 @@ class Pipeline:
                         masks=dilres.dilated,
                     )
 
-    def iter_tile_overlap_outputs(self) -> Iterator[OverlapTileResult]:
+    def _process_single_tile(
+        self,
+        tile: TileIndex,
+        radii: List[float],
+        z: int,
+    ) -> OverlapTileResult:
+        """Process a single tile and return the result."""
+        tile_y, tile_x = self.cfg.tile_xy
+        ys, xs = tile_slices(tile, tile_y, tile_x)
+
+        actual_z = z
+        actual_y = ys.stop - ys.start
+        actual_x = xs.stop - xs.start
+        tile_shape = (actual_z, actual_y, actual_x)
+        total_voxels = actual_z * actual_y * actual_x
+
+        masks: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
+        marker_vox_gpu: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
+        sum_intensity_gpu: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
+
+        for ch_batch in chunked(self.cfg.channels, self.cfg.channel_batch):
+            vol_cpu = self.A_hi[0, ch_batch, :, ys, xs].compute()
+            vol_gpu = cp.asarray(vol_cpu)
+
+            for i, ch in enumerate(ch_batch):
+                v = vol_gpu[i]
+                tstats = self.th.compute_tile_gpu(v, self._t_global[ch])
+                mask0 = self.th.apply_gpu(v, tstats.t_final)
+                mask1, _ = self.cc(mask0)
+                
+                dilres: DilationResult = self.dil(mask1)
+
+                for r in radii:
+                    m = dilres.dilated[r]
+                    masks[r][ch] = m
+                    marker_vox_gpu[r][ch] = cp.count_nonzero(m)
+                    if r == radii[0]:
+                        if cp.any(m):
+                            sum_intensity_gpu[r][ch] = cp.sum(v[m])
+                        else:
+                            sum_intensity_gpu[r][ch] = cp.asarray(0.0)
+                    else:
+                        sum_intensity_gpu[r][ch] = sum_intensity_gpu[radii[0]][ch]
+            
+            del vol_gpu
+
+        marker_vox: Dict[float, Dict[int, int]] = {r: {} for r in radii}
+        sum_intensity: Dict[float, Dict[int, float]] = {r: {} for r in radii}
+        
+        gpu_scalars = []
+        scalar_keys = []  
+        
+        for r in radii:
+            for ch in self.cfg.channels:
+                gpu_scalars.append(marker_vox_gpu[r][ch])
+                scalar_keys.append(('vox', r, ch))
+                gpu_scalars.append(sum_intensity_gpu[r][ch])
+                scalar_keys.append(('int', r, ch))
+        
+        cpu_values = [float(s.get()) for s in gpu_scalars]
+        
+        for i, (typ, r, ch) in enumerate(scalar_keys):
+            if typ == 'vox':
+                marker_vox[r][ch] = int(cpu_values[i])
+            else:
+                sum_intensity[r][ch] = cpu_values[i]
+        
+        del marker_vox_gpu
+        del sum_intensity_gpu
+        
+        result = self.overlap_miner.run(
+            tile_x=tile.tx,
+            tile_y=tile.ty,
+            tile_shape=tile_shape,
+            total_voxels=total_voxels,
+            masks=masks,
+            marker_vox=marker_vox,
+            sum_intensity=sum_intensity,  
+        )
+        
+        del masks
+        cp.get_default_memory_pool().free_all_blocks()
+        
+        return result
+
+    def run_tile_processing(
+        self,
+        resume: bool = True,
+    ) -> int:
+        """
+        STAGE 1 (GPU): Process tiles and save checkpoints.
+        
+        This can be interrupted and resumed. Each tile is saved immediately
+        after processing.
+        
+        Args:
+            resume: If True, skip tiles that have already been checkpointed.
+        
+        Returns:
+            Number of tiles processed in this run.
+        """
         if not self._t_global:
             self.compute_global_thresholds()
 
@@ -142,98 +249,70 @@ class Pipeline:
         n_tiles_y = (y + tile_y - 1) // tile_y
         n_tiles_x = (x + tile_x - 1) // tile_x
         total_tiles = n_tiles_y * n_tiles_x
-        tile_count = 0
-
+        
+        checkpoint_dir = Path(self.cfg.checkpoint_dir) / self.cfg.output_name
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        completed: Set[Tuple[int, int]] = set()
+        if resume:
+            completed = get_completed_tiles(checkpoint_dir)
+            if completed:
+                print(f"[Checkpoint] Found {len(completed)} completed tiles, resuming...")
+        
+        print(f"[Pipeline] Processing {total_tiles} tiles ({n_tiles_y} x {n_tiles_x})")
+        print(f"[Pipeline] Checkpoints: {checkpoint_dir}")
+        
+        tiles_processed = 0
+        tiles_skipped = 0
+        start_time = time.time()
+        
         for tile in iter_tiles_xy(y, x, tile_y=tile_y, tile_x=tile_x):
-            tile_count += 1
-            ys, xs = tile_slices(tile, tile_y, tile_x)
+            tile_key = (tile.tx, tile.ty)
+            
+            if tile_key in completed:
+                tiles_skipped += 1
+                continue
+            
+            result = self._process_single_tile(tile, radii, z)
+            
+            save_tile_checkpoint(checkpoint_dir, result)
+            
+            tiles_processed += 1
+            total_done = tiles_processed + tiles_skipped
+            
+            if tiles_processed % 5 == 0:
+                elapsed = time.time() - start_time
+                rate = tiles_processed / elapsed if elapsed > 0 else 0
+                remaining = (total_tiles - total_done) / rate if rate > 0 else 0
+                print(
+                    f"  [{total_done}/{total_tiles}] "
+                    f"Processed: {tiles_processed}, Skipped: {tiles_skipped}, "
+                    f"Rate: {rate:.2f} tiles/sec, ETA: {remaining/60:.1f} min"
+                )
+        
+        elapsed = time.time() - start_time
+        print(f"\n[Pipeline] Tile processing complete!")
+        print(f"  Processed: {tiles_processed} tiles")
+        print(f"  Skipped (resumed): {tiles_skipped} tiles")
+        print(f"  Time: {elapsed/60:.1f} minutes")
+        print(f"  Checkpoints saved to: {checkpoint_dir}")
+        
+        return tiles_processed
 
-            actual_z = z
-            actual_y = ys.stop - ys.start
-            actual_x = xs.stop - xs.start
-            tile_shape = (actual_z, actual_y, actual_x)
-            total_voxels = actual_z * actual_y * actual_x
-
-            masks: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
-            
-            marker_vox_gpu: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
-            sum_intensity_gpu: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
-
-            for ch_batch in chunked(self.cfg.channels, self.cfg.channel_batch):
-                vol_cpu = self.A_hi[0, ch_batch, :, ys, xs].compute()
-                vol_gpu = cp.asarray(vol_cpu)
-
-                for i, ch in enumerate(ch_batch):
-                    v = vol_gpu[i]
-                    tstats = self.th.compute_tile_gpu(v, self._t_global[ch])
-                    mask0 = self.th.apply_gpu(v, tstats.t_final)
-                    mask1, _ = self.cc(mask0)
-                    
-                    dilres: DilationResult = self.dil(mask1)
-
-                    for r in radii:
-                        m = dilres.dilated[r]
-                        masks[r][ch] = m
-                        marker_vox_gpu[r][ch] = cp.count_nonzero(m)
-                        if r == radii[0]:
-                            if cp.any(m):
-                                sum_intensity_gpu[r][ch] = cp.sum(v[m])
-                            else:
-                                sum_intensity_gpu[r][ch] = cp.asarray(0.0)
-                        else:
-                            sum_intensity_gpu[r][ch] = sum_intensity_gpu[radii[0]][ch]
-                
-                del vol_gpu
-
-            marker_vox: Dict[float, Dict[int, int]] = {r: {} for r in radii}
-            sum_intensity: Dict[float, Dict[int, float]] = {r: {} for r in radii}
-            
-            gpu_scalars = []
-            scalar_keys = []  
-            
-            for r in radii:
-                for ch in self.cfg.channels:
-                    gpu_scalars.append(marker_vox_gpu[r][ch])
-                    scalar_keys.append(('vox', r, ch))
-                    gpu_scalars.append(sum_intensity_gpu[r][ch])
-                    scalar_keys.append(('int', r, ch))
-            
-           
-            cpu_values = [float(s.get()) for s in gpu_scalars]  
-            
-            for i, (typ, r, ch) in enumerate(scalar_keys):
-                if typ == 'vox':
-                    marker_vox[r][ch] = int(cpu_values[i])
-                else:
-                    sum_intensity[r][ch] = cpu_values[i]
-            
-            del marker_vox_gpu
-            del sum_intensity_gpu
-            
-            result = self.overlap_miner.run(
-                tile_x=tile.tx,
-                tile_y=tile.ty,
-                tile_shape=tile_shape,
-                total_voxels=total_voxels,
-                masks=masks,
-                marker_vox=marker_vox,
-                sum_intensity=sum_intensity,  
-            )
-            
-            del masks
-            cp.get_default_memory_pool().free_all_blocks()
-            
-            yield result
-
-    def run_full_analysis(
+    def run_aggregation(
         self,
         channel_names: List[str] | None = None,
     ) -> Path:
+        """
+        STAGE 2 (CPU): Load checkpoints, aggregate, and write database.
+        
+        This runs entirely on CPU and can be run separately from tile processing.
+        
+        Returns:
+            Path to the output .bioset file.
+        """
         from .aggregation import HierarchicalAggregator
         from .writer import BiosetWriter
-        
-        if not self._t_global:
-            self.compute_global_thresholds()
         
         _, _, z, y, x = self.A_hi.shape
         tile_y, tile_x = self.cfg.tile_xy
@@ -241,28 +320,38 @@ class Pipeline:
         if channel_names is None:
             channel_names = [f"ch{i}" for i in self.cfg.channels]
         
+        checkpoint_dir = Path(self.cfg.checkpoint_dir) / self.cfg.output_name
+        
+        stats = get_checkpoint_stats(checkpoint_dir)
+        print(f"[Aggregation] Loading checkpoints from: {checkpoint_dir}")
+        print(f"[Aggregation] Found {stats['n_completed']} checkpointed tiles")
+        
+        if stats['n_completed'] == 0:
+            raise RuntimeError(
+                f"No checkpoints found in {checkpoint_dir}. "
+                "Run run_tile_processing() first."
+            )
+        
+        print("[Aggregation] Loading tile results...")
+        start_time = time.time()
+        results = load_all_checkpoints(checkpoint_dir)
+        print(f"  Loaded {len(results)} tiles in {time.time() - start_time:.1f}s")
+        
         aggregator = HierarchicalAggregator(
             base_tile_y=tile_y,
             base_tile_x=tile_x,
             n_levels=self.cfg.hierarchy_levels,
         )
         
-        # Process all tiles
-        print(f"Processing tiles...")
-        tile_count = 0
-        for result in self.iter_tile_overlap_outputs():
+        print("[Aggregation] Adding results to aggregator...")
+        for result in results:
             aggregator.add_tile_result(result)
-            tile_count += 1
-            if tile_count % 5 == 0:
-                print(f"  Processed {tile_count} tiles...")
         
-        print(f"Total tiles: {tile_count}")
-        
-        # Aggregate
-        print("Aggregating hierarchies...")
+        print("[Aggregation] Computing hierarchical aggregation...")
+        start_time = time.time()
         levels = aggregator.aggregate()
+        print(f"  Aggregation took {time.time() - start_time:.1f}s")
         
-        # Build hierarchy level metadata
         hierarchy_meta = []
         for lvl in levels:
             hierarchy_meta.append({
@@ -273,10 +362,14 @@ class Pipeline:
                 "n_pairs": len(lvl.pairs),
                 "n_sets": len(lvl.sets),
             })
+            print(f"  Level {lvl.level}: {len(lvl.pairs)} pairs, {len(lvl.sets)} sets")
         
-        # Write to database
-        output_path = Path(self.cfg.output_dir) / f"{self.cfg.output_name}.bioset"
-        print(f"Writing to {output_path}...")
+        output_dir = Path(self.cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{self.cfg.output_name}.bioset"
+        
+        print(f"[Aggregation] Writing to {output_path}...")
+        start_time = time.time()
         
         writer = BiosetWriter(
             output_path=output_path,
@@ -288,10 +381,30 @@ class Pipeline:
         writer.write_metadata(hierarchy_meta)
         
         for level in levels:
-            print(f"  Writing level {level.level}...")
             writer.write_hierarchy_level(level)
         
         final_path = writer.finalize()
-        print(f"Done! Output: {final_path}")
+        print(f"  Database written in {time.time() - start_time:.1f}s")
+        print(f"\n[Aggregation] Complete! Output: {final_path}")
         
         return final_path
+
+    def run_full_analysis(
+        self,
+        channel_names: List[str] | None = None,
+        resume: bool = True,
+    ) -> Path:
+        self.run_tile_processing(resume=resume)
+        return self.run_aggregation(channel_names=channel_names)
+
+    def iter_tile_overlap_outputs(self) -> Iterator[OverlapTileResult]:
+        """Iterate over tile results (legacy method, no checkpointing)."""
+        if not self._t_global:
+            self.compute_global_thresholds()
+
+        _, _, z, y, x = self.A_hi.shape
+        tile_y, tile_x = self.cfg.tile_xy
+        radii = sorted(float(r) for r in self.cfg.dilate_um)
+
+        for tile in iter_tiles_xy(y, x, tile_y=tile_y, tile_x=tile_x):
+            yield self._process_single_tile(tile, radii, z)

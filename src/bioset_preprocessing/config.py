@@ -47,4 +47,7 @@ class PipelineConfig:
     
     # Output
     output_dir: str = "results"
-    output_name: str = "analysis"    
+    output_name: str = "analysis"  
+    
+    #Checkopointing
+    checkpoint_dir: str="checkpoints"  
