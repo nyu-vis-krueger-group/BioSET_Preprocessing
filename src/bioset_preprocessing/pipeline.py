@@ -155,8 +155,9 @@ class Pipeline:
             total_voxels = actual_z * actual_y * actual_x
 
             masks: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
-            marker_vox: Dict[float, Dict[int, int]] = {r: {} for r in radii}
-            sum_intensity: Dict[float, Dict[int, float]] = {r: {} for r in radii}
+            
+            marker_vox_gpu: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
+            sum_intensity_gpu: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
 
             for ch_batch in chunked(self.cfg.channels, self.cfg.channel_batch):
                 vol_cpu = self.A_hi[0, ch_batch, :, ys, xs].compute()
@@ -173,14 +174,41 @@ class Pipeline:
                     for r in radii:
                         m = dilres.dilated[r]
                         masks[r][ch] = m
-                        marker_vox[r][ch] = int(cp.count_nonzero(m))
-                        
-                        if marker_vox[r][ch] > 0:
-                            sum_intensity[r][ch] = float(cp.sum(v[m]))
+                        marker_vox_gpu[r][ch] = cp.count_nonzero(m)
+                        if r == radii[0]:
+                            if cp.any(m):
+                                sum_intensity_gpu[r][ch] = cp.sum(v[m])
+                            else:
+                                sum_intensity_gpu[r][ch] = cp.asarray(0.0)
                         else:
-                            sum_intensity[r][ch] = 0.0
+                            sum_intensity_gpu[r][ch] = sum_intensity_gpu[radii[0]][ch]
+                
+                del vol_gpu
+
+            marker_vox: Dict[float, Dict[int, int]] = {r: {} for r in radii}
+            sum_intensity: Dict[float, Dict[int, float]] = {r: {} for r in radii}
             
-            del vol_gpu
+            gpu_scalars = []
+            scalar_keys = []  
+            
+            for r in radii:
+                for ch in self.cfg.channels:
+                    gpu_scalars.append(marker_vox_gpu[r][ch])
+                    scalar_keys.append(('vox', r, ch))
+                    gpu_scalars.append(sum_intensity_gpu[r][ch])
+                    scalar_keys.append(('int', r, ch))
+            
+           
+            cpu_values = [float(s.get()) for s in gpu_scalars]  
+            
+            for i, (typ, r, ch) in enumerate(scalar_keys):
+                if typ == 'vox':
+                    marker_vox[r][ch] = int(cpu_values[i])
+                else:
+                    sum_intensity[r][ch] = cpu_values[i]
+            
+            del marker_vox_gpu
+            del sum_intensity_gpu
             
             result = self.overlap_miner.run(
                 tile_x=tile.tx,
@@ -210,11 +238,9 @@ class Pipeline:
         _, _, z, y, x = self.A_hi.shape
         tile_y, tile_x = self.cfg.tile_xy
         
-        # Default channel names
         if channel_names is None:
             channel_names = [f"ch{i}" for i in self.cfg.channels]
         
-        # Create aggregator
         aggregator = HierarchicalAggregator(
             base_tile_y=tile_y,
             base_tile_x=tile_x,

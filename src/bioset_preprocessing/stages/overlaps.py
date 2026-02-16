@@ -58,27 +58,56 @@ class OverlapTileResult:
     n_frequent_pairs: int = 0
 
 
-def _compute_pairwise_intersections_batched(
-    masks: Dict[int, cp.ndarray],
+def _stack_masks(masks_ch: Dict[int, cp.ndarray], channels: List[int]) -> cp.ndarray:
+    """Stack channel masks into (n_channels, Z, Y, X) array for vectorized ops."""
+    return cp.stack([masks_ch[ch] for ch in channels], axis=0)
+
+
+def _compute_pairwise_batched_stacked(
+    stacked: cp.ndarray,
+    ch_to_idx: Dict[int, int],
     pairs: List[Tuple[int, int]],
-) -> cp.ndarray:
-    if not pairs:
-        return cp.array([], dtype=cp.int64)
-    
+) -> Tuple[cp.ndarray, cp.ndarray]:
+    """
+    Compute intersections and unions for all pairs using stacked masks.
+    Returns (inter_counts, union_counts) as GPU arrays.
+    """
     n_pairs = len(pairs)
-    counts = cp.zeros(n_pairs, dtype=cp.int64)
+    if n_pairs == 0:
+        return cp.array([], dtype=cp.int64), cp.array([], dtype=cp.int64)
     
-    # Process in chunks to avoid memory spikes
-    chunk_size = 256
-    for start in range(0, n_pairs, chunk_size):
-        end = min(start + chunk_size, n_pairs)
-        chunk_pairs = pairs[start:end]
-        
-        for i, (a, b) in enumerate(chunk_pairs):
-            inter = masks[a] & masks[b]
-            counts[start + i] = cp.count_nonzero(inter)
+    inter_counts = cp.zeros(n_pairs, dtype=cp.int64)
+    union_counts = cp.zeros(n_pairs, dtype=cp.int64)
     
-    return counts
+    for i, (a, b) in enumerate(pairs):
+        mask_a = stacked[ch_to_idx[a]]
+        mask_b = stacked[ch_to_idx[b]]
+        inter_counts[i] = cp.count_nonzero(mask_a & mask_b)
+        union_counts[i] = cp.count_nonzero(mask_a | mask_b)
+    
+    return inter_counts, union_counts
+
+
+def _compute_set_intersection_stacked(
+    stacked: cp.ndarray,
+    ch_to_idx: Dict[int, int],
+    members: Tuple[int, ...],
+) -> Tuple[int, int]:
+    """Compute intersection and union for a set of channels."""
+    indices = [ch_to_idx[ch] for ch in members]
+    
+    # Intersection: AND all masks
+    inter_mask = stacked[indices[0]]
+    for idx in indices[1:]:
+        inter_mask = inter_mask & stacked[idx]
+    
+    # Union: OR all masks
+    union_mask = stacked[indices[0]]
+    for idx in indices[1:]:
+        union_mask = union_mask | stacked[idx]
+    
+    # Return GPU arrays (will sync later)
+    return cp.count_nonzero(inter_mask), cp.count_nonzero(union_mask)
 
 
 class OverlapMiner:
@@ -118,9 +147,19 @@ class OverlapMiner:
     ) -> OverlapTileResult:
         channels = sorted(next(iter(masks.values())).keys()) if masks else []
 
-        # Filter to active markers per radius
+        # Build channel index mapping for stacked arrays
+        ch_to_idx = {ch: i for i, ch in enumerate(channels)}
+
+        # Pre-stack masks for each radius (enables vectorized operations)
+        stacked_masks: Dict[float, cp.ndarray] = {}
+        for r in self.radii:
+            if channels:
+                stacked_masks[r] = _stack_masks(masks[r], channels)
+
+        # Filter to active markers per radius and build channel stats
         active: Dict[float, List[int]] = {}
         channel_stats: List[ChannelTileStats] = []
+        
         for r in self.radii:
             active[r] = []
             min_vox_thr = self._thr(self.min_marker_vox, r)
@@ -156,23 +195,31 @@ class OverlapMiner:
                 n_frequent_pairs=0,
             )
 
-        # Compute ALL pairwise intersections at r_max
+        # Compute ALL pairwise intersections at r_max using stacked masks
         all_pairs = list(combinations(active_max, 2))
         ms_pair_max = self._thr(self.min_support_pair, self.r_max)
         
-        inter_counts = _compute_pairwise_intersections_batched(
-            masks[self.r_max], all_pairs
+        inter_counts_gpu, union_counts_gpu = _compute_pairwise_batched_stacked(
+            stacked_masks[self.r_max], ch_to_idx, all_pairs
         )
-        inter_counts_cpu = cp.asnumpy(inter_counts)
         
+        # Single sync for all pair counts at r_max
+        inter_counts_cpu = cp.asnumpy(inter_counts_gpu)
+        union_counts_cpu = cp.asnumpy(union_counts_gpu)
+        
+        # Filter to frequent pairs
         freq_pairs: List[Tuple[int, int]] = []
-        freq_pair_inters: Dict[Tuple[int, int], int] = {}
+        freq_pair_data: Dict[Tuple[int, int], Dict] = {}  # Cache r_max results
         
         for i, (a, b) in enumerate(all_pairs):
-            if inter_counts_cpu[i] >= ms_pair_max:
+            inter = int(inter_counts_cpu[i])
+            if inter >= ms_pair_max:
                 pair = (a, b)
                 freq_pairs.append(pair)
-                freq_pair_inters[pair] = int(inter_counts_cpu[i])
+                freq_pair_data[pair] = {
+                    'inter': inter,
+                    'union': int(union_counts_cpu[i]),
+                }
         
         n_freq_pairs = len(freq_pairs)
         
@@ -217,78 +264,123 @@ class OverlapMiner:
                     break
 
         # Evaluate pairs across all radii
+        # Batch compute for each radius, then sync once per radius
         all_pairs_out: List[PairRow] = []
         
-        for (a, b) in freq_pairs:
-            for r in self.radii_desc:
-                if a not in active[r] or b not in active[r]:
-                    if self.aggressive_stop_on_fail:
-                        break
-                    continue
+        for r in self.radii_desc:
+            # Get pairs active at this radius
+            pairs_at_r = [(a, b) for (a, b) in freq_pairs 
+                          if a in active[r] and b in active[r]]
+            
+            if not pairs_at_r:
+                if self.aggressive_stop_on_fail:
+                    break
+                continue
+            
+            ms = self._thr(self.min_support_pair, r)
+            
+            if r == self.r_max:
+                # Use cached values
+                for (a, b) in pairs_at_r:
+                    data = freq_pair_data[(a, b)]
+                    inter = data['inter']
+                    uni = data['union']
+                    
+                    if inter < ms:
+                        continue
+                    
+                    a_vox = marker_vox[r][a]
+                    b_vox = marker_vox[r][b]
+                    iou = inter / uni if uni > 0 else 0.0
+                    oc = inter / min(a_vox, b_vox) if min(a_vox, b_vox) > 0 else 0.0
+                    
+                    all_pairs_out.append(PairRow(
+                        tile_x=tile_x,
+                        tile_y=tile_y,
+                        r_um=float(r),
+                        a=a,
+                        b=b,
+                        a_vox=a_vox,
+                        b_vox=b_vox,
+                        inter_vox=inter,
+                        union_vox=uni,
+                        iou=iou,
+                        overlap_coeff=oc,
+                    ))
+            else:
+                # Batch compute for this radius
+                inter_gpu, union_gpu = _compute_pairwise_batched_stacked(
+                    stacked_masks[r], ch_to_idx, pairs_at_r
+                )
+                # Single sync per radius
+                inter_cpu = cp.asnumpy(inter_gpu)
+                union_cpu = cp.asnumpy(union_gpu)
                 
-                # Use cached value for r_max, compute for others
-                if r == self.r_max:
-                    inter = freq_pair_inters[(a, b)]
-                else:
-                    inter = int(cp.count_nonzero(masks[r][a] & masks[r][b]))
-                
-                ms = self._thr(self.min_support_pair, r)
-                if inter < ms:
-                    if self.aggressive_stop_on_fail:
-                        break
-                    continue
-                
-                uni = int(cp.count_nonzero(masks[r][a] | masks[r][b]))
-                a_vox = marker_vox[r][a]
-                b_vox = marker_vox[r][b]
-                
-                iou = inter / uni if uni > 0 else 0.0
-                oc = inter / min(a_vox, b_vox) if min(a_vox, b_vox) > 0 else 0.0
-                
-                all_pairs_out.append(PairRow(
-                    tile_x=tile_x,
-                    tile_y=tile_y,
-                    r_um=float(r),
-                    a=a,
-                    b=b,
-                    a_vox=a_vox,
-                    b_vox=b_vox,
-                    inter_vox=inter,
-                    union_vox=uni,
-                    iou=iou,
-                    overlap_coeff=oc,
-                ))
+                for i, (a, b) in enumerate(pairs_at_r):
+                    inter = int(inter_cpu[i])
+                    uni = int(union_cpu[i])
+                    
+                    if inter < ms:
+                        continue
+                    
+                    a_vox = marker_vox[r][a]
+                    b_vox = marker_vox[r][b]
+                    iou = inter / uni if uni > 0 else 0.0
+                    oc = inter / min(a_vox, b_vox) if min(a_vox, b_vox) > 0 else 0.0
+                    
+                    all_pairs_out.append(PairRow(
+                        tile_x=tile_x,
+                        tile_y=tile_y,
+                        r_um=float(r),
+                        a=a,
+                        b=b,
+                        a_vox=a_vox,
+                        b_vox=b_vox,
+                        inter_vox=inter,
+                        union_vox=uni,
+                        iou=iou,
+                        overlap_coeff=oc,
+                    ))
 
         # Evaluate higher-order sets
+        # Batch per radius: collect all GPU results, then sync
         all_sets_out: List[SetRow] = []
         
-        for comb in cand_sets:
-            for r in self.radii_desc:
-                if any(ch not in active[r] for ch in comb):
-                    if self.aggressive_stop_on_fail:
-                        break
-                    continue
+        for r in self.radii_desc:
+            # Get sets active at this radius
+            sets_at_r = [comb for comb in cand_sets 
+                         if all(ch in active[r] for ch in comb)]
+            
+            if not sets_at_r:
+                if self.aggressive_stop_on_fail:
+                    break
+                continue
+            
+            ms = self._thr(self.min_support_set, r)
+            
+            # Batch compute intersections and unions
+            inter_results = []
+            union_results = []
+            
+            for comb in sets_at_r:
+                inter_gpu, union_gpu = _compute_set_intersection_stacked(
+                    stacked_masks[r], ch_to_idx, comb
+                )
+                inter_results.append(inter_gpu)
+                union_results.append(union_gpu)
+            
+            # Single sync for all sets at this radius
+            inter_cpu = [int(x.get()) for x in inter_results]
+            union_cpu = [int(x.get()) for x in union_results]
+            
+            for i, comb in enumerate(sets_at_r):
+                inter = inter_cpu[i]
+                uni = union_cpu[i]
                 
-                # Compute intersection
-                inter_mask = masks[r][comb[0]]
-                for ch in comb[1:]:
-                    inter_mask = inter_mask & masks[r][ch]
-                inter = int(cp.count_nonzero(inter_mask))
-                
-                ms = self._thr(self.min_support_set, r)
                 if inter < ms:
-                    if self.aggressive_stop_on_fail:
-                        break
                     continue
-                
-                # Compute union
-                uni_mask = masks[r][comb[0]]
-                for ch in comb[1:]:
-                    uni_mask = uni_mask | masks[r][ch]
-                uni = int(cp.count_nonzero(uni_mask))
                 
                 iou = inter / uni if uni > 0 else 0.0
-                
                 member_voxels = [marker_vox[r][ch] for ch in comb]
                 min_member = min(member_voxels) if member_voxels else 0
                 overlap_coeff = inter / min_member if min_member > 0 else 0.0
@@ -305,10 +397,13 @@ class OverlapMiner:
                     overlap_coeff=float(overlap_coeff), 
                 ))
 
+        # Free stacked masks
+        del stacked_masks
+
         return OverlapTileResult(
             tile_x=tile_x,
             tile_y=tile_y,
-            tile_z=0,  # full z
+            tile_z=0,
             tile_shape=tile_shape,
             total_voxels=total_voxels,
             radii_um=list(self.radii),
