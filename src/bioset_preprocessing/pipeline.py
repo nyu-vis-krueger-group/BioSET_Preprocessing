@@ -67,8 +67,8 @@ class Pipeline:
                 self.comp_lo, self.A_lo = self.pyr_remote.highest_res()
                 global_source = "remote(highest)"
 
-        print(f"[Pipeline] HI source: {hi_source} component={self.comp_hi} shape={self.A_hi.shape}", flush=True)
-        print(f"[Pipeline] GLOBAL source: {global_source} component={self.comp_lo} shape={self.A_lo.shape}", flush=True)
+        print(f"[Pipeline] High res source: {hi_source} component={self.comp_hi} shape={self.A_hi.shape}")
+        print(f"[Pipeline] Global threshold source: {global_source} component={self.comp_lo} shape={self.A_lo.shape}")
 
         self.th = AlphaThreshold(alpha=cfg.alpha, trim_q=cfg.trim_q)
         self.cc = ConnectedComponentsFilter(
@@ -137,8 +137,14 @@ class Pipeline:
         _, _, z, y, x = self.A_hi.shape
         tile_y, tile_x = self.cfg.tile_xy
         radii = sorted(float(r) for r in self.cfg.dilate_um)
+        
+        n_tiles_y = (y + tile_y - 1) // tile_y
+        n_tiles_x = (x + tile_x - 1) // tile_x
+        total_tiles = n_tiles_y * n_tiles_x
+        tile_count = 0
 
         for tile in iter_tiles_xy(y, x, tile_y=tile_y, tile_x=tile_x):
+            tile_count += 1
             ys, xs = tile_slices(tile, tile_y, tile_x)
 
             masks: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
@@ -160,10 +166,17 @@ class Pipeline:
                         m = dilres.dilated[r]
                         masks[r][ch] = m
                         marker_vox[r][ch] = int(cp.count_nonzero(m))
-
-            yield self.overlap_miner.run(
+            
+            del vol_gpu
+            
+            result = self.overlap_miner.run(
                 tile_x=tile.tx,
                 tile_y=tile.ty,
                 masks=masks,
                 marker_vox=marker_vox,
             )
+            
+            del masks
+            cp.get_default_memory_pool().free_all_blocks()
+            
+            yield result

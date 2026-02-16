@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import cupy as cp
 
@@ -36,72 +36,41 @@ class SetRow:
 
 @dataclass
 class OverlapTileResult:
-    """All overlap stats for a (tile_x, tile_y) across radii."""
-
     tile_x: int
     tile_y: int
     radii_um: List[float]
-    # marker_vox[r][ch] = count
     marker_vox: Dict[float, Dict[int, int]]
     pairs: List[PairRow]
     sets: List[SetRow]
+    
+    n_active_channels: int = 0
+    n_frequent_pairs: int = 0
 
 
-def _inter_count_gpu(masks_ch: Dict[int, cp.ndarray], chs: Sequence[int]) -> int:
-    it = iter(chs)
-    inter = masks_ch[next(it)]
-    for ch in it:
-        inter = inter & masks_ch[ch]
-        if not bool(cp.any(inter)):
-            return 0
-    return int(cp.count_nonzero(inter))
-
-
-def _union_count_gpu(masks_ch: Dict[int, cp.ndarray], chs: Sequence[int]) -> int:
-    it = iter(chs)
-    uni = masks_ch[next(it)]
-    for ch in it:
-        uni = uni | masks_ch[ch]
-    return int(cp.count_nonzero(uni))
-
-
-def _pair_metrics(a_vox: int, b_vox: int, inter_vox: int, union_vox: int) -> Tuple[float, float]:
-    iou = (inter_vox / union_vox) if union_vox > 0 else 0.0
-    denom = min(a_vox, b_vox)
-    overlap_coeff = (inter_vox / denom) if denom > 0 else 0.0
-    return float(iou), float(overlap_coeff)
-
-
-def _apriori_candidates_from_pairs(freq_pairs: Iterable[Tuple[int, int]], k: int) -> List[Tuple[int, ...]]:
-    pair_set = set(tuple(sorted(p)) for p in freq_pairs)
-    items = sorted({i for p in pair_set for i in p})
-
-    cands: List[Tuple[int, ...]] = []
-    for comb in combinations(items, k):
-        ok = True
-        for a, b in combinations(comb, 2):
-            if (a, b) not in pair_set:
-                ok = False
-                break
-        if ok:
-            cands.append(comb)
-    return cands
+def _compute_pairwise_intersections_batched(
+    masks: Dict[int, cp.ndarray],
+    pairs: List[Tuple[int, int]],
+) -> cp.ndarray:
+    if not pairs:
+        return cp.array([], dtype=cp.int64)
+    
+    n_pairs = len(pairs)
+    counts = cp.zeros(n_pairs, dtype=cp.int64)
+    
+    # Process in chunks to avoid memory spikes
+    chunk_size = 256
+    for start in range(0, n_pairs, chunk_size):
+        end = min(start + chunk_size, n_pairs)
+        chunk_pairs = pairs[start:end]
+        
+        for i, (a, b) in enumerate(chunk_pairs):
+            inter = masks[a] & masks[b]
+            counts[start + i] = cp.count_nonzero(inter)
+    
+    return counts
 
 
 class OverlapMiner:
-    """Mine pairwise + higher-order overlaps per tile, across dilation radii.
-
-    Inputs are the boolean masks produced by threshold/CC/dilation stages:
-        masks[r_um][ch] -> cp.bool_ array (Z,Y,X)
-
-    The miner implements:
-      1) marker presence filtering per radius
-      2) frequent pair mining at max radius (for candidate generation)
-      3) apriori-like candidate generation for k>=3 (every pair must be frequent)
-      4) dilation-sweep pruning: evaluate from largest->smallest radius and
-         stop early when failing support thresholds.
-    """
-
     def __init__(
         self,
         radii_um: Sequence[float],
@@ -135,14 +104,16 @@ class OverlapMiner:
     ) -> OverlapTileResult:
         channels = sorted(next(iter(masks.values())).keys()) if masks else []
 
-        # Active markers per radius
+        # Filter to active markers per radius
         active: Dict[float, List[int]] = {}
         for r in self.radii:
             mm = self._thr(self.min_marker_vox, r)
             active[r] = [ch for ch in channels if marker_vox[r][ch] >= mm]
 
         active_max = active[self.r_max]
-        if len(active_max) < 2:
+        n_active = len(active_max)
+        
+        if n_active < 2:
             return OverlapTileResult(
                 tile_x=tile_x,
                 tile_y=tile_y,
@@ -150,111 +121,157 @@ class OverlapMiner:
                 marker_vox=marker_vox,
                 pairs=[],
                 sets=[],
+                n_active_channels=n_active,
+                n_frequent_pairs=0,
             )
 
-        # Frequent pairs at r_max
-        freq_pairs: List[Tuple[int, int]] = []
+        # Compute ALL pairwise intersections at r_max
+        all_pairs = list(combinations(active_max, 2))
         ms_pair_max = self._thr(self.min_support_pair, self.r_max)
-        for a, b in combinations(active_max, 2):
-            inter = _inter_count_gpu(masks[self.r_max], (a, b))
-            if inter >= ms_pair_max:
-                freq_pairs.append((a, b))
-
-        # Candidate sets upto max set size 
+        
+        inter_counts = _compute_pairwise_intersections_batched(
+            masks[self.r_max], all_pairs
+        )
+        inter_counts_cpu = cp.asnumpy(inter_counts)
+        
+        freq_pairs: List[Tuple[int, int]] = []
+        freq_pair_inters: Dict[Tuple[int, int], int] = {}
+        
+        for i, (a, b) in enumerate(all_pairs):
+            if inter_counts_cpu[i] >= ms_pair_max:
+                pair = (a, b)
+                freq_pairs.append(pair)
+                freq_pair_inters[pair] = int(inter_counts_cpu[i])
+        
+        n_freq_pairs = len(freq_pairs)
+        
+        if n_freq_pairs == 0:
+            return OverlapTileResult(
+                tile_x=tile_x,
+                tile_y=tile_y,
+                radii_um=list(self.radii),
+                marker_vox=marker_vox,
+                pairs=[],
+                sets=[],
+                n_active_channels=n_active,
+                n_frequent_pairs=0,
+            )
+        
+        # Generate higher-order candidates using Apriori
         cand_sets: List[Tuple[int, ...]] = []
-        for k in range(3, self.max_set_size + 1):
-            cand_sets.extend(_apriori_candidates_from_pairs(freq_pairs, k))
+        
+        if self.max_set_size >= 3 and n_freq_pairs <= 5000:
+            freq_pair_set = set(freq_pairs)
+            items = sorted({i for p in freq_pairs for i in p})
+            
+            for k in range(3, self.max_set_size + 1):
+                if len(items) > 50 and k > 3:
+                    break
+                    
+                for comb in combinations(items, k):
+                    all_freq = True
+                    for a, b in combinations(comb, 2):
+                        if (a, b) not in freq_pair_set and (b, a) not in freq_pair_set:
+                            all_freq = False
+                            break
+                    if all_freq:
+                        cand_sets.append(comb)
+                
+                if len(cand_sets) > 10000:
+                    cand_sets = cand_sets[:10000]
+                    break
 
-        def sweep_eval(ch_tuple: Tuple[int, ...]) -> Tuple[List[PairRow], List[SetRow]]:
-            out_pairs: List[PairRow] = []
-            out_sets: List[SetRow] = []
-
-            # must be active at max dilation
-            if any(ch not in active[self.r_max] for ch in ch_tuple):
-                return out_pairs, out_sets
-
+        # Evaluate pairs across all radii
+        all_pairs_out: List[PairRow] = []
+        
+        for (a, b) in freq_pairs:
             for r in self.radii_desc:
-                # skip if any member absent at this dilation
-                if any(ch not in active[r] for ch in ch_tuple):
-                    if r == self.r_max:
-                        return [], []
+                if a not in active[r] or b not in active[r]:
                     if self.aggressive_stop_on_fail:
                         break
                     continue
-
-                inter = _inter_count_gpu(masks[r], ch_tuple)
-                min_support = (
-                    self._thr(self.min_support_set, r)
-                    if len(ch_tuple) >= 3
-                    else self._thr(self.min_support_pair, r)
-                )
-
-                # if fails at max dilation, will fail at smaller dilations, skip
-                if r == self.r_max and inter < min_support:
-                    return [], []
-
-                if inter >= min_support:
-                    uni = _union_count_gpu(masks[r], ch_tuple)
-
-                    if len(ch_tuple) == 2:
-                        a, b = ch_tuple
-                        a_vox = int(marker_vox[r][a])
-                        b_vox = int(marker_vox[r][b])
-                        iou, oc = _pair_metrics(a_vox, b_vox, inter, uni)
-                        out_pairs.append(
-                            PairRow(
-                                tile_x=tile_x,
-                                tile_y=tile_y,
-                                r_um=float(r),
-                                a=a,
-                                b=b,
-                                a_vox=a_vox,
-                                b_vox=b_vox,
-                                inter_vox=int(inter),
-                                union_vox=int(uni),
-                                iou=iou,
-                                overlap_coeff=oc,
-                            )
-                        )
-                    else:
-                        iou = (inter / uni) if uni > 0 else 0.0
-                        out_sets.append(
-                            SetRow(
-                                tile_x=tile_x,
-                                tile_y=tile_y,
-                                r_um=float(r),
-                                k=len(ch_tuple),
-                                members=tuple(ch_tuple),
-                                inter_vox=int(inter),
-                                union_vox=int(uni),
-                                iou=float(iou),
-                            )
-                        )
+                
+                # Use cached value for r_max, compute for others
+                if r == self.r_max:
+                    inter = freq_pair_inters[(a, b)]
                 else:
+                    inter = int(cp.count_nonzero(masks[r][a] & masks[r][b]))
+                
+                ms = self._thr(self.min_support_pair, r)
+                if inter < ms:
                     if self.aggressive_stop_on_fail:
                         break
+                    continue
+                
+                uni = int(cp.count_nonzero(masks[r][a] | masks[r][b]))
+                a_vox = marker_vox[r][a]
+                b_vox = marker_vox[r][b]
+                
+                iou = inter / uni if uni > 0 else 0.0
+                oc = inter / min(a_vox, b_vox) if min(a_vox, b_vox) > 0 else 0.0
+                
+                all_pairs_out.append(PairRow(
+                    tile_x=tile_x,
+                    tile_y=tile_y,
+                    r_um=float(r),
+                    a=a,
+                    b=b,
+                    a_vox=a_vox,
+                    b_vox=b_vox,
+                    inter_vox=inter,
+                    union_vox=uni,
+                    iou=iou,
+                    overlap_coeff=oc,
+                ))
 
-            return out_pairs, out_sets
-
-        # evaluate pairs and sets
-        all_pairs: List[PairRow] = []
-        all_sets: List[SetRow] = []
-
-        for p in freq_pairs:
-            pr, sr = sweep_eval(tuple(sorted(p)))
-            all_pairs.extend(pr)
-            all_sets.extend(sr)
-
-        for s in cand_sets:
-            pr, sr = sweep_eval(s)
-            all_pairs.extend(pr)
-            all_sets.extend(sr)
+        # Evaluate higher-order sets
+        all_sets_out: List[SetRow] = []
+        
+        for comb in cand_sets:
+            for r in self.radii_desc:
+                if any(ch not in active[r] for ch in comb):
+                    if self.aggressive_stop_on_fail:
+                        break
+                    continue
+                
+                # Compute intersection
+                inter_mask = masks[r][comb[0]]
+                for ch in comb[1:]:
+                    inter_mask = inter_mask & masks[r][ch]
+                inter = int(cp.count_nonzero(inter_mask))
+                
+                ms = self._thr(self.min_support_set, r)
+                if inter < ms:
+                    if self.aggressive_stop_on_fail:
+                        break
+                    continue
+                
+                # Compute union
+                uni_mask = masks[r][comb[0]]
+                for ch in comb[1:]:
+                    uni_mask = uni_mask | masks[r][ch]
+                uni = int(cp.count_nonzero(uni_mask))
+                
+                iou = inter / uni if uni > 0 else 0.0
+                
+                all_sets_out.append(SetRow(
+                    tile_x=tile_x,
+                    tile_y=tile_y,
+                    r_um=float(r),
+                    k=len(comb),
+                    members=comb,
+                    inter_vox=inter,
+                    union_vox=uni,
+                    iou=iou,
+                ))
 
         return OverlapTileResult(
             tile_x=tile_x,
             tile_y=tile_y,
             radii_um=list(self.radii),
             marker_vox=marker_vox,
-            pairs=all_pairs,
-            sets=all_sets,
+            pairs=all_pairs_out,
+            sets=all_sets_out,
+            n_active_channels=n_active,
+            n_frequent_pairs=n_freq_pairs,
         )

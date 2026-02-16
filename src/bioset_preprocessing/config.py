@@ -36,8 +36,8 @@ class PipelineConfig:
     float64_distances: bool = False      # for edt   
 
     # Overlaps
-    max_set_size: int = 5
-    min_marker_vox: Dict[float, int] | int = 0      # per dilation radius or single value
-    min_support_pair: Dict[float, int] | int = 0    # min intersection for pairs
-    min_support_set: Dict[float, int] | int = 0     # min intersection for k>=3
-    aggressive_stop_on_fail: bool = True            # stop at smaller radii if fails
+    max_set_size: int = 4                           
+    min_marker_vox: Dict[float, int] | int = 1000     
+    min_support_pair: Dict[float, int] | int = 100   
+    min_support_set: Dict[float, int] | int = 50     
+    aggressive_stop_on_fail: bool = True            
