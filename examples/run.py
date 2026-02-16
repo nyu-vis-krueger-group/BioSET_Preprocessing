@@ -9,7 +9,6 @@ ome_xml = ome_types.from_xml(response.text.replace("Â",""))
 CHANNEL_NAMES = [c.name for c in ome_xml.images[0].pixels.channels]
 
 cfg = PipelineConfig(
-    zarr_path="data/rechunk_mis_128_2048_5120.zarr",
     zarr_url="https://lsp-public-data.s3.amazonaws.com/biomedvis-challenge-2025/Dataset1-LSP13626-melanoma-in-situ/0",
     channels=list(range(70)),
     tile_xy=(128, 128),
@@ -21,9 +20,9 @@ cfg = PipelineConfig(
     channel_batch=70,
     # Overlap mining
     max_set_size=4,
-    min_marker_vox=100,
-    min_support_pair=50,
-    min_support_set=10,
+    min_marker_vox=500,
+    min_support_pair=100,
+    min_support_set=50,
     # Hierarchy
     hierarchy_levels=4,
     # Output
