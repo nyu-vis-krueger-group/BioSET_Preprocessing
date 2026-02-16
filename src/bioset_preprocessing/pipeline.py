@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterator, Sequence, List
+from pathlib import Path
 
 import numpy as np
 import cupy as cp
@@ -147,8 +148,15 @@ class Pipeline:
             tile_count += 1
             ys, xs = tile_slices(tile, tile_y, tile_x)
 
+            actual_z = z
+            actual_y = ys.stop - ys.start
+            actual_x = xs.stop - xs.start
+            tile_shape = (actual_z, actual_y, actual_x)
+            total_voxels = actual_z * actual_y * actual_x
+
             masks: Dict[float, Dict[int, cp.ndarray]] = {r: {} for r in radii}
             marker_vox: Dict[float, Dict[int, int]] = {r: {} for r in radii}
+            sum_intensity: Dict[float, Dict[int, float]] = {r: {} for r in radii}
 
             for ch_batch in chunked(self.cfg.channels, self.cfg.channel_batch):
                 vol_cpu = self.A_hi[0, ch_batch, :, ys, xs].compute()
@@ -166,17 +174,98 @@ class Pipeline:
                         m = dilres.dilated[r]
                         masks[r][ch] = m
                         marker_vox[r][ch] = int(cp.count_nonzero(m))
+                        
+                        if marker_vox[r][ch] > 0:
+                            sum_intensity[r][ch] = float(cp.sum(v[m]))
+                        else:
+                            sum_intensity[r][ch] = 0.0
             
             del vol_gpu
             
             result = self.overlap_miner.run(
                 tile_x=tile.tx,
                 tile_y=tile.ty,
+                tile_shape=tile_shape,
+                total_voxels=total_voxels,
                 masks=masks,
                 marker_vox=marker_vox,
+                sum_intensity=sum_intensity,  
             )
             
             del masks
             cp.get_default_memory_pool().free_all_blocks()
             
             yield result
+
+    def run_full_analysis(
+        self,
+        channel_names: List[str] | None = None,
+    ) -> Path:
+        from .aggregation import HierarchicalAggregator
+        from .writer import BiosetWriter
+        
+        if not self._t_global:
+            self.compute_global_thresholds()
+        
+        _, _, z, y, x = self.A_hi.shape
+        tile_y, tile_x = self.cfg.tile_xy
+        
+        # Default channel names
+        if channel_names is None:
+            channel_names = [f"ch{i}" for i in self.cfg.channels]
+        
+        # Create aggregator
+        aggregator = HierarchicalAggregator(
+            base_tile_y=tile_y,
+            base_tile_x=tile_x,
+            n_levels=self.cfg.hierarchy_levels,
+        )
+        
+        # Process all tiles
+        print(f"Processing tiles...")
+        tile_count = 0
+        for result in self.iter_tile_overlap_outputs():
+            aggregator.add_tile_result(result)
+            tile_count += 1
+            if tile_count % 50 == 0:
+                print(f"  Processed {tile_count} tiles...")
+        
+        print(f"Total tiles: {tile_count}")
+        
+        # Aggregate
+        print("Aggregating hierarchies...")
+        levels = aggregator.aggregate()
+        
+        # Build hierarchy level metadata
+        hierarchy_meta = []
+        for lvl in levels:
+            hierarchy_meta.append({
+                "level": lvl.level,
+                "tile_size_x": lvl.tile_size_x,
+                "tile_size_y": lvl.tile_size_y,
+                "n_channels": len(lvl.channels),
+                "n_pairs": len(lvl.pairs),
+                "n_sets": len(lvl.sets),
+            })
+        
+        # Write to database
+        output_path = Path(self.cfg.output_dir) / f"{self.cfg.output_name}.bioset"
+        print(f"Writing to {output_path}...")
+        
+        writer = BiosetWriter(
+            output_path=output_path,
+            channel_names=channel_names,
+            dilation_amounts=self.cfg.dilate_um,
+            volume_shape=(z, y, x),
+        )
+        
+        writer.write_metadata(hierarchy_meta)
+        
+        for level in levels:
+            print(f"  Writing level {level.level}...")
+            writer.write_hierarchy_level(level)
+        
+        final_path = writer.finalize()
+        print(f"Done! Output: {final_path}")
+        
+        return final_path

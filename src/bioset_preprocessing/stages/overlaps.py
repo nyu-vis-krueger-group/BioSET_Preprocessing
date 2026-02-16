@@ -6,6 +6,14 @@ from typing import Dict, List, Sequence, Tuple
 
 import cupy as cp
 
+@dataclass
+class ChannelTileStats:
+    tile_x: int
+    tile_y: int
+    channel: int
+    r_um: float
+    voxel_count: int          
+    sum_intensity: float      
 
 @dataclass
 class PairRow:
@@ -21,7 +29,6 @@ class PairRow:
     iou: float
     overlap_coeff: float
 
-
 @dataclass
 class SetRow:
     tile_x: int
@@ -32,17 +39,21 @@ class SetRow:
     inter_vox: int
     union_vox: int
     iou: float
+    overlap_coeff: float
 
 
 @dataclass
 class OverlapTileResult:
     tile_x: int
     tile_y: int
+    tile_z: int
+    tile_shape: Tuple[int, int, int]
+    total_voxels: int
     radii_um: List[float]
     marker_vox: Dict[float, Dict[int, int]]
+    channel_stats: List[ChannelTileStats]
     pairs: List[PairRow]
     sets: List[SetRow]
-    
     n_active_channels: int = 0
     n_frequent_pairs: int = 0
 
@@ -99,16 +110,32 @@ class OverlapMiner:
         *,
         tile_x: int,
         tile_y: int,
+        tile_shape: Tuple[int, int, int],
+        total_voxels: int,
         masks: Dict[float, Dict[int, cp.ndarray]],
         marker_vox: Dict[float, Dict[int, int]],
+        sum_intensity: Dict[float, Dict[int, float]],
     ) -> OverlapTileResult:
         channels = sorted(next(iter(masks.values())).keys()) if masks else []
 
         # Filter to active markers per radius
         active: Dict[float, List[int]] = {}
+        channel_stats: List[ChannelTileStats] = []
         for r in self.radii:
-            mm = self._thr(self.min_marker_vox, r)
-            active[r] = [ch for ch in channels if marker_vox[r][ch] >= mm]
+            active[r] = []
+            min_vox_thr = self._thr(self.min_marker_vox, r)
+            for ch in channels:
+                vox_count = marker_vox[r][ch]
+                channel_stats.append(ChannelTileStats(
+                    tile_x=tile_x,
+                    tile_y=tile_y,
+                    channel=ch,
+                    r_um=r,
+                    voxel_count=vox_count,
+                    sum_intensity=sum_intensity[r][ch],
+                ))
+                if vox_count >= min_vox_thr:
+                    active[r].append(ch)
 
         active_max = active[self.r_max]
         n_active = len(active_max)
@@ -117,8 +144,12 @@ class OverlapMiner:
             return OverlapTileResult(
                 tile_x=tile_x,
                 tile_y=tile_y,
+                tile_z=0,
+                tile_shape=tile_shape,
+                total_voxels=total_voxels,
                 radii_um=list(self.radii),
                 marker_vox=marker_vox,
+                channel_stats=channel_stats,
                 pairs=[],
                 sets=[],
                 n_active_channels=n_active,
@@ -149,8 +180,12 @@ class OverlapMiner:
             return OverlapTileResult(
                 tile_x=tile_x,
                 tile_y=tile_y,
+                tile_z=0,
+                tile_shape=tile_shape,
+                total_voxels=total_voxels,
                 radii_um=list(self.radii),
                 marker_vox=marker_vox,
+                channel_stats=channel_stats,
                 pairs=[],
                 sets=[],
                 n_active_channels=n_active,
@@ -254,6 +289,10 @@ class OverlapMiner:
                 
                 iou = inter / uni if uni > 0 else 0.0
                 
+                member_voxels = [marker_vox[r][ch] for ch in comb]
+                min_member = min(member_voxels) if member_voxels else 0
+                overlap_coeff = inter / min_member if min_member > 0 else 0.0
+                
                 all_sets_out.append(SetRow(
                     tile_x=tile_x,
                     tile_y=tile_y,
@@ -262,14 +301,19 @@ class OverlapMiner:
                     members=comb,
                     inter_vox=inter,
                     union_vox=uni,
-                    iou=iou,
+                    iou=float(iou),
+                    overlap_coeff=float(overlap_coeff), 
                 ))
 
         return OverlapTileResult(
             tile_x=tile_x,
             tile_y=tile_y,
+            tile_z=0,  # full z
+            tile_shape=tile_shape,
+            total_voxels=total_voxels,
             radii_um=list(self.radii),
             marker_vox=marker_vox,
+            channel_stats=channel_stats,
             pairs=all_pairs_out,
             sets=all_sets_out,
             n_active_channels=n_active,

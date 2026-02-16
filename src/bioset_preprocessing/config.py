@@ -40,4 +40,11 @@ class PipelineConfig:
     min_marker_vox: Dict[float, int] | int = 1000     
     min_support_pair: Dict[float, int] | int = 100   
     min_support_set: Dict[float, int] | int = 50     
-    aggressive_stop_on_fail: bool = True            
+    aggressive_stop_on_fail: bool = True       
+
+    # Hierarchical aggregation
+    hierarchy_levels: int = 4 
+    
+    # Output
+    output_dir: str = "results"
+    output_name: str = "analysis"    
