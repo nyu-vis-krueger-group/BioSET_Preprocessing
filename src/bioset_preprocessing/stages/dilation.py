@@ -1,12 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Sequence, Dict
+from typing import Sequence, Dict, Optional
 import cupy as cp
 from cupyx.scipy.ndimage import distance_transform_edt  
 
 @dataclass
 class DilationResult:
-    dist_um: cp.ndarray
+    dist_um: Optional[cp.ndarray]  
     dilated: Dict[float, cp.ndarray]  
 
 class EDTSweepDilation:
