@@ -253,7 +253,7 @@ class Pipeline:
         for result in self.iter_tile_overlap_outputs():
             aggregator.add_tile_result(result)
             tile_count += 1
-            if tile_count % 50 == 0:
+            if tile_count % 5 == 0:
                 print(f"  Processed {tile_count} tiles...")
         
         print(f"Total tiles: {tile_count}")
