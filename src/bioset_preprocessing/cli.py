@@ -35,6 +35,14 @@ def main():
     run.add_argument("--vox", default="0.14,0.14,0.28", help="Voxel size x,y,z in µm")
     run.add_argument("--float64-dist", action="store_true", help="Use float64 EDT distances (slower, more precise)")
 
+    run.add_argument("--max-set-size", type=int, default=4)
+    run.add_argument("--min-marker-vox", type=int, default=100)
+    run.add_argument("--min-support-pair", type=int, default=50)
+    run.add_argument("--min-support-set", type=int, default=10)
+    run.add_argument("--hierarchy-levels", type=int, default=4)
+    run.add_argument("--output-dir", default="results")
+    run.add_argument("--output-name", default="analysis")
+
     args = p.parse_args()
     if not args.zarr_url and not args.zarr_path:
         run.error("Provide at least one of --zarr-url or --zarr-path")
@@ -58,14 +66,15 @@ def main():
         connectivity=args.conn,
         dilate_um=tuple(dilate_um),
         float64_distances=args.float64_dist,
+        max_set_size=args.max_set_size,
+        min_marker_vox=args.min_marker_vox,
+        min_support_pair=args.min_support_pair,
+        min_support_set=args.min_support_set,
+        hierarchy_levels=args.hierarchy_levels,
+        output_dir=args.output_dir,
+        output_name=args.output_name,
     )
 
     pipe = Pipeline(cfg)
-    pipe.compute_global_thresholds()
-
-    n = 0
-    for _ in pipe.iter_tile_outputs():
-        n += 1
-        if n % 100 == 0:
-            print(f"Processed {n} outputs (channel-tile pairs)...")
-    print("Done. Total outputs:", n)
+    output_path = pipe.run_full_analysis()
+    print(f"Done! Output: {output_path}")

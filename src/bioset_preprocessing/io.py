@@ -55,9 +55,12 @@ class ZarrPyramid:
         return max(self.arrays.items(), key=lambda kv: kv[1].size)
 
     def lowest_res(self) -> Tuple[str, da.Array]:
-        # assume highest index is lowest; else pick min shape
-        if "6" in self.arrays:
-            return "6", self.arrays["6"]
+        # For numeric keys, pick highest number (lowest resolution)
+        numeric_keys = [k for k in self.arrays.keys() if k.isdigit()]
+        if numeric_keys:
+            key = max(numeric_keys, key=int)
+            return key, self.arrays[key]
+        # Fallback: pick smallest by size
         return min(self.arrays.items(), key=lambda kv: kv[1].size)
 
     def is_multiplexed(self) -> bool:
