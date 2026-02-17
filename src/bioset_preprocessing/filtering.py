@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import gzip
+import json
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Set, Optional
 from pathlib import Path
 from collections import defaultdict
-import heapq
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 from .stages.overlaps import (
     OverlapTileResult,
@@ -12,408 +15,424 @@ from .stages.overlaps import (
     PairRow,
     SetRow,
 )
-from .checkpoint import load_all_checkpoints, save_tile_checkpoint
 
 
 @dataclass
 class FilterConfig:
     """Configuration for filtering tile results."""
     
-    # Minimum thresholds (applied per tile)
-    min_iou: float = 0.0                    # Min IoU to keep a pair/set in a tile
-    min_overlap_coeff: float = 0.0          # Min overlap coefficient
-    min_inter_vox: int = 0                  # Min intersection voxels
+    # Minimum thresholds (applied at max dilation first)
+    min_overlap_coeff: float = 0.0
+    min_inter_vox: int = 0
     
-    # Global filters (applied across all tiles)
-    min_tiles_present: int = 1              # Combination must appear in at least N tiles
-    min_tiles_percent: float = 0.0          # Combination must appear in at least X% of tiles
+    # If True, filter by max dilation - if it fails, remove all dilations for that combo
+    filter_by_max_dilation: bool = True
     
-    # Top-K filtering (keep only best tiles per combination)
-    top_k_tiles: Optional[int] = None       # Keep top K tiles per combination (by overlap_coeff)
-    top_k_percent: Optional[float] = None   # Keep top K% tiles per combination
+    # Global: combination must appear in at least N tiles (at max dilation)
+    min_tiles_present: int = 1
     
-    # Combination limits
-    max_pairs_per_tile: Optional[int] = None    # Limit pairs per tile
-    max_sets_per_tile: Optional[int] = None     # Limit sets per tile
+    # Top-K: keep only top X% of tiles per combination (by overlap_coeff at max dilation)
+    top_k_percent: Optional[float] = None  # e.g., 0.25 for top 25%
     
-    # Set size filtering
-    min_set_size: int = 2                   # Minimum k (2=pairs only, 3=include triplets, etc.)
-    max_set_size: int = 10                  # Maximum k
+    # Set size limits
+    min_set_size: int = 2
+    max_set_size: int = 10
+    
+    # Parallelism
+    n_workers: int = 8
 
 
-@dataclass
+@dataclass 
 class FilterStats:
-    """Statistics from filtering operation."""
     tiles_processed: int = 0
     pairs_before: int = 0
     pairs_after: int = 0
     sets_before: int = 0
     sets_after: int = 0
-    unique_pairs_before: int = 0
-    unique_pairs_after: int = 0
-    unique_sets_before: int = 0
-    unique_sets_after: int = 0
-    
-    @property
-    def pairs_removed_pct(self) -> float:
-        if self.pairs_before == 0:
-            return 0.0
-        return 100 * (1 - self.pairs_after / self.pairs_before)
-    
-    @property
-    def sets_removed_pct(self) -> float:
-        if self.sets_before == 0:
-            return 0.0
-        return 100 * (1 - self.sets_after / self.sets_before)
     
     def __str__(self) -> str:
+        p_pct = 100 * (1 - self.pairs_after / max(1, self.pairs_before))
+        s_pct = 100 * (1 - self.sets_after / max(1, self.sets_before))
         return (
             f"FilterStats:\n"
-            f"  Tiles processed: {self.tiles_processed}\n"
-            f"  Pairs: {self.pairs_before:,} → {self.pairs_after:,} "
-            f"({self.pairs_removed_pct:.1f}% removed)\n"
-            f"  Sets: {self.sets_before:,} → {self.sets_after:,} "
-            f"({self.sets_removed_pct:.1f}% removed)\n"
-            f"  Unique pairs: {self.unique_pairs_before:,} → {self.unique_pairs_after:,}\n"
-            f"  Unique sets: {self.unique_sets_before:,} → {self.unique_sets_after:,}"
+            f"  Tiles: {self.tiles_processed}\n"
+            f"  Pairs: {self.pairs_before:,} → {self.pairs_after:,} ({p_pct:.1f}% removed)\n"
+            f"  Sets: {self.sets_before:,} → {self.sets_after:,} ({s_pct:.1f}% removed)"
         )
 
 
-def _pair_key(p: PairRow) -> Tuple:
-    """Create a hashable key for a pair."""
-    return (p.a, p.b, p.r_um)
+def _load_checkpoint_raw(filepath: Path) -> dict:
+    """Load checkpoint as raw dict (faster than creating dataclasses)."""
+    with gzip.open(filepath, 'rt', encoding='utf-8') as f:
+        return json.load(f)
 
 
-def _set_key(s: SetRow) -> Tuple:
-    """Create a hashable key for a set."""
-    return (s.members, s.r_um)
+def _save_checkpoint_raw(filepath: Path, data: dict) -> None:
+    """Save checkpoint from raw dict."""
+    with gzip.open(filepath, 'wt', encoding='utf-8') as f:
+        json.dump(data, f)
 
 
-class TileFilter:
+def _get_max_dilation(radii: List[float]) -> float:
+    """Get the maximum dilation radius."""
+    return max(radii)
+
+
+# ============================================================================
+# PASS 1: Collect statistics (parallel)
+# ============================================================================
+
+def _collect_stats_from_file(filepath: Path, max_r: float, cfg: FilterConfig) -> dict:
     """
-    Filter tile results to reduce data size before aggregation.
+    Collect statistics from a single checkpoint file.
+    Returns dict with pair/set stats at max dilation only.
+    """
+    data = _load_checkpoint_raw(filepath)
+    tile_x, tile_y = data['tile_x'], data['tile_y']
     
-    Example usage:
+    pair_stats = {}  # (a, b) -> {'count': int, 'max_oc': float, 'best_tile': (oc, tx, ty)}
+    set_stats = {}   
+    
+    # Process pairs at max dilation only
+    for p in data['pairs']:
+        if p['r_um'] != max_r:
+            continue
+        if p['k'] if 'k' in p else 2 < cfg.min_set_size:
+            continue
+            
+        key = (p['a'], p['b'])
+        oc = p['overlap_coeff']
+        inter = p['inter_vox']
+        
+        # Apply per-tile threshold
+        if oc < cfg.min_overlap_coeff or inter < cfg.min_inter_vox:
+            continue
+        
+        if key not in pair_stats:
+            pair_stats[key] = {'count': 0, 'best_oc': 0.0, 'best_tile': None}
+        
+        pair_stats[key]['count'] += 1
+        if oc > pair_stats[key]['best_oc']:
+            pair_stats[key]['best_oc'] = oc
+            pair_stats[key]['best_tile'] = (oc, tile_x, tile_y)
+    
+    # Process sets at max dilation only
+    for s in data['sets']:
+        if s['r_um'] != max_r:
+            continue
+        if s['k'] < cfg.min_set_size or s['k'] > cfg.max_set_size:
+            continue
+            
+        key = tuple(s['members'])
+        oc = s['overlap_coeff']
+        inter = s['inter_vox']
+        
+        if oc < cfg.min_overlap_coeff or inter < cfg.min_inter_vox:
+            continue
+        
+        if key not in set_stats:
+            set_stats[key] = {'count': 0, 'best_oc': 0.0, 'best_tile': None}
+        
+        set_stats[key]['count'] += 1
+        if oc > set_stats[key]['best_oc']:
+            set_stats[key]['best_oc'] = oc
+            set_stats[key]['best_tile'] = (oc, tile_x, tile_y)
+    
+    return {
+        'filepath': str(filepath),
+        'pair_stats': pair_stats,
+        'set_stats': set_stats,
+    }
+
+
+def _merge_stats(all_stats: List[dict]) -> Tuple[dict, dict]:
+    """Merge statistics from all files."""
+    pair_global = {}  # (a,b) -> {'count': total, 'tiles': [(oc, tx, ty), ...]}
+    set_global = {}
+    
+    for stats in all_stats:
+        for key, s in stats['pair_stats'].items():
+            if key not in pair_global:
+                pair_global[key] = {'count': 0, 'tiles': []}
+            pair_global[key]['count'] += s['count']
+            if s['best_tile']:
+                pair_global[key]['tiles'].append(s['best_tile'])
+        
+        for key, s in stats['set_stats'].items():
+            if key not in set_global:
+                set_global[key] = {'count': 0, 'tiles': []}
+            set_global[key]['count'] += s['count']
+            if s['best_tile']:
+                set_global[key]['tiles'].append(s['best_tile'])
+    
+    return pair_global, set_global
+
+
+def _compute_top_k_tiles(
+    global_stats: dict, 
+    top_k_percent: float,
+) -> Dict[Tuple, Set[Tuple[int, int]]]:
+    
+    keep_tiles = {}
+    
+    for key, stats in global_stats.items():
+        tiles = stats['tiles']
+        if not tiles:
+            continue
+        
+        tiles_sorted = sorted(tiles, key=lambda x: x[0], reverse=True)
+        
+        k = max(1, int(len(tiles_sorted) * top_k_percent))
+        top_tiles = tiles_sorted[:k]
+        
+        keep_tiles[key] = {(t[1], t[2]) for t in top_tiles}
+    
+    return keep_tiles
+
+def _filter_single_file(args: Tuple) -> dict:
+    """
+    Filter a single checkpoint file based on global statistics.
+    """
+    (filepath, max_r, cfg, valid_pairs, valid_sets, 
+     pair_keep_tiles, set_keep_tiles) = args
+    
+    data = _load_checkpoint_raw(filepath)
+    tile_coord = (data['tile_x'], data['tile_y'])
+    
+    pairs_before = len(data['pairs'])
+    sets_before = len(data['sets'])
+    
+    filtered_pairs = []
+    for p in data['pairs']:
+        key = (p['a'], p['b'])
+        
+        if key not in valid_pairs:
+            continue
+        
+        if cfg.filter_by_max_dilation:
+            if p['r_um'] == max_r:
+                if p['overlap_coeff'] < cfg.min_overlap_coeff:
+                    continue
+                if p['inter_vox'] < cfg.min_inter_vox:
+                    continue
+                if pair_keep_tiles and key in pair_keep_tiles:
+                    if tile_coord not in pair_keep_tiles[key]:
+                        continue
+            
+        filtered_pairs.append(p)
+    
+    filtered_sets = []
+    for s in data['sets']:
+        key = tuple(s['members'])
+        
+        if s['k'] < cfg.min_set_size or s['k'] > cfg.max_set_size:
+            continue
+        
+        if key not in valid_sets:
+            continue
+        
+        if cfg.filter_by_max_dilation:
+            if s['r_um'] == max_r:
+                if s['overlap_coeff'] < cfg.min_overlap_coeff:
+                    continue
+                if s['inter_vox'] < cfg.min_inter_vox:
+                    continue
+                if set_keep_tiles and key in set_keep_tiles:
+                    if tile_coord not in set_keep_tiles[key]:
+                        continue
+        
+        filtered_sets.append(s)
+    
+    data['pairs'] = filtered_pairs
+    data['sets'] = filtered_sets
+    
+    return {
+        'filepath': filepath,
+        'data': data,
+        'pairs_before': pairs_before,
+        'pairs_after': len(filtered_pairs),
+        'sets_before': sets_before,
+        'sets_after': len(filtered_sets),
+    }
+
+class StreamingFilter:
+    """
+    High-performance streaming filter for large checkpoint datasets.
+    
+    Usage:
         filter_cfg = FilterConfig(
-            min_overlap_coeff=0.1,      # Drop weak overlaps
-            top_k_percent=0.25,         # Keep top 25% tiles per combination
-            min_tiles_present=5,        # Combination must appear in 5+ tiles
+            min_overlap_coeff=0.05,
+            min_tiles_present=10,
+            top_k_percent=0.25,
+            n_workers=16,
         )
         
-        filterer = TileFilter(filter_cfg)
-        filtered_results = filterer.filter_checkpoints(checkpoint_dir)
-        stats = filterer.get_stats()
+        filterer = StreamingFilter(filter_cfg)
+        filterer.filter_checkpoints(
+            input_dir=Path("checkpoints/melanoma"),
+            output_dir=Path("checkpoints/melanoma_filtered"),
+        )
     """
     
     def __init__(self, config: FilterConfig):
         self.config = config
-        self._stats = FilterStats()
-        
-    def get_stats(self) -> FilterStats:
-        return self._stats
+        self.stats = FilterStats()
     
     def filter_checkpoints(
         self,
-        checkpoint_dir: Path,
-        output_dir: Optional[Path] = None,
-    ) -> List[OverlapTileResult]:
-        """
-        Load checkpoints, filter them, and optionally save filtered versions.
+        input_dir: Path,
+        output_dir: Path,
+    ) -> FilterStats:
+       
+        cfg = self.config
+        filepaths = sorted(input_dir.glob("tile_*.json.gz"))
+        n_files = len(filepaths)
         
-        Args:
-            checkpoint_dir: Directory containing tile checkpoints
-            output_dir: If provided, save filtered checkpoints here
+        if n_files == 0:
+            raise RuntimeError(f"No checkpoints found in {input_dir}")
+        
+        print(f"[StreamingFilter] Found {n_files} checkpoint files")
+        print(f"[StreamingFilter] Using {cfg.n_workers} workers")
+        
+        first_data = _load_checkpoint_raw(filepaths[0])
+        max_r = _get_max_dilation(first_data['radii_um'])
+        print(f"[StreamingFilter] Max dilation radius: {max_r}")
+        
+        print(f"\n[Pass 1/2] Collecting statistics at r={max_r}...")
+        
+        all_stats = []
+        with ProcessPoolExecutor(max_workers=cfg.n_workers) as executor:
+            futures = {
+                executor.submit(_collect_stats_from_file, fp, max_r, cfg): fp 
+                for fp in filepaths
+            }
             
-        Returns:
-            List of filtered OverlapTileResult objects
-        """
-        print(f"[Filter] Loading checkpoints from {checkpoint_dir}...")
-        results = load_all_checkpoints(checkpoint_dir)
-        print(f"[Filter] Loaded {len(results)} tiles")
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
+                all_stats.append(result)
+                completed += 1
+                if completed % 500 == 0:
+                    print(f"  [{completed}/{n_files}] files processed...")
         
-        if not results:
-            return []
+        print(f"  [{n_files}/{n_files}] Pass 1 complete")
         
-        self._stats = FilterStats(tiles_processed=len(results))
+        print("[Pass 1/2] Merging statistics...")
+        pair_global, set_global = _merge_stats(all_stats)
         
-        for r in results:
-            self._stats.pairs_before += len(r.pairs)
-            self._stats.sets_before += len(r.sets)
+        print(f"  Unique pairs at r={max_r}: {len(pair_global):,}")
+        print(f"  Unique sets at r={max_r}: {len(set_global):,}")
         
-        print("[Filter] Applying per-tile filters...")
-        filtered_results = [self._filter_single_tile(r) for r in results]
+        valid_pairs = {
+            k for k, v in pair_global.items() 
+            if v['count'] >= cfg.min_tiles_present
+        }
+        valid_sets = {
+            k for k, v in set_global.items()
+            if v['count'] >= cfg.min_tiles_present
+        }
         
-        print("[Filter] Computing global statistics...")
-        pair_tile_counts, set_tile_counts = self._count_tiles_per_combination(filtered_results)
-        pair_best_tiles, set_best_tiles = self._find_best_tiles_per_combination(filtered_results)
+        print(f"  After min_tiles_present={cfg.min_tiles_present}:")
+        print(f"    Valid pairs: {len(valid_pairs):,}")
+        print(f"    Valid sets: {len(valid_sets):,}")
         
-        print("[Filter] Applying global filters...")
-        filtered_results = [
-            self._apply_global_filters(
-                r, 
-                pair_tile_counts, 
-                set_tile_counts,
-                pair_best_tiles,
-                set_best_tiles,
-                len(results),
-            )
-            for r in filtered_results
+        pair_keep_tiles = None
+        set_keep_tiles = None
+        
+        if cfg.top_k_percent is not None:
+            print(f"[Pass 1/2] Computing top {cfg.top_k_percent*100:.0f}% tiles per combination...")
+            
+            pair_global_valid = {k: v for k, v in pair_global.items() if k in valid_pairs}
+            set_global_valid = {k: v for k, v in set_global.items() if k in valid_sets}
+            
+            pair_keep_tiles = _compute_top_k_tiles(pair_global_valid, cfg.top_k_percent)
+            set_keep_tiles = _compute_top_k_tiles(set_global_valid, cfg.top_k_percent)
+            
+            print(f"    Pairs with top-K tiles: {len(pair_keep_tiles):,}")
+            print(f"    Sets with top-K tiles: {len(set_keep_tiles):,}")
+        
+        del all_stats, pair_global, set_global
+        
+        print(f"\n[Pass 2/2] Applying filters and writing output...")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        args_list = [
+            (fp, max_r, cfg, valid_pairs, valid_sets, pair_keep_tiles, set_keep_tiles)
+            for fp in filepaths
         ]
         
-        unique_pairs: Set[Tuple] = set()
-        unique_sets: Set[Tuple] = set()
-        for r in filtered_results:
-            self._stats.pairs_after += len(r.pairs)
-            self._stats.sets_after += len(r.sets)
-            for p in r.pairs:
-                unique_pairs.add(_pair_key(p))
-            for s in r.sets:
-                unique_sets.add(_set_key(s))
+        self.stats = FilterStats(tiles_processed=n_files)
         
-        unique_pairs_before: Set[Tuple] = set()
-        unique_sets_before: Set[Tuple] = set()
-        for r in results:
-            for p in r.pairs:
-                unique_pairs_before.add(_pair_key(p))
-            for s in r.sets:
-                unique_sets_before.add(_set_key(s))
-        
-        self._stats.unique_pairs_before = len(unique_pairs_before)
-        self._stats.unique_pairs_after = len(unique_pairs)
-        self._stats.unique_sets_before = len(unique_sets_before)
-        self._stats.unique_sets_after = len(unique_sets)
-        
-        print(f"[Filter] {self._stats}")
-        
-        if output_dir:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[Filter] Saving filtered checkpoints to {output_dir}...")
-            for r in filtered_results:
-                save_tile_checkpoint(output_dir, r)
-            print(f"[Filter] Saved {len(filtered_results)} filtered checkpoints")
-        
-        return filtered_results
-    
-    def _filter_single_tile(self, result: OverlapTileResult) -> OverlapTileResult:
-        cfg = self.config
-        
-        filtered_pairs = []
-        for p in result.pairs:
-            if p.iou < cfg.min_iou:
-                continue
-            if p.overlap_coeff < cfg.min_overlap_coeff:
-                continue
-            if p.inter_vox < cfg.min_inter_vox:
-                continue
-            filtered_pairs.append(p)
-        
-        if cfg.max_pairs_per_tile and len(filtered_pairs) > cfg.max_pairs_per_tile:
-            filtered_pairs.sort(key=lambda p: p.overlap_coeff, reverse=True)
-            filtered_pairs = filtered_pairs[:cfg.max_pairs_per_tile]
-        
-        filtered_sets = []
-        for s in result.sets:
-            if s.k < cfg.min_set_size or s.k > cfg.max_set_size:
-                continue
-            if s.iou < cfg.min_iou:
-                continue
-            if s.overlap_coeff < cfg.min_overlap_coeff:
-                continue
-            if s.inter_vox < cfg.min_inter_vox:
-                continue
-            filtered_sets.append(s)
-        
-        if cfg.max_sets_per_tile and len(filtered_sets) > cfg.max_sets_per_tile:
-            filtered_sets.sort(key=lambda s: s.overlap_coeff, reverse=True)
-            filtered_sets = filtered_sets[:cfg.max_sets_per_tile]
-        
-        return OverlapTileResult(
-            tile_x=result.tile_x,
-            tile_y=result.tile_y,
-            tile_z=result.tile_z,
-            tile_shape=result.tile_shape,
-            total_voxels=result.total_voxels,
-            radii_um=result.radii_um,
-            marker_vox=result.marker_vox,
-            channel_stats=result.channel_stats,
-            pairs=filtered_pairs,
-            sets=filtered_sets,
-            n_active_channels=result.n_active_channels,
-            n_frequent_pairs=result.n_frequent_pairs,
-        )
-    
-    def _count_tiles_per_combination(
-        self,
-        results: List[OverlapTileResult],
-    ) -> Tuple[Dict[Tuple, int], Dict[Tuple, int]]:
-        pair_counts: Dict[Tuple, int] = defaultdict(int)
-        set_counts: Dict[Tuple, int] = defaultdict(int)
-        
-        for r in results:
-            for p in r.pairs:
-                pair_counts[_pair_key(p)] += 1
-            for s in r.sets:
-                set_counts[_set_key(s)] += 1
-        
-        return pair_counts, set_counts
-    
-    def _find_best_tiles_per_combination(
-        self,
-        results: List[OverlapTileResult],
-    ) -> Tuple[Dict[Tuple, List[Tuple[float, int, int]]], Dict[Tuple, List[Tuple[float, int, int]]]]:
-        pair_tiles: Dict[Tuple, List[Tuple[float, int, int]]] = defaultdict(list)
-        set_tiles: Dict[Tuple, List[Tuple[float, int, int]]] = defaultdict(list)
-        
-        for r in results:
-            for p in r.pairs:
-                key = _pair_key(p)
-                pair_tiles[key].append((p.overlap_coeff, r.tile_x, r.tile_y))
-            for s in r.sets:
-                key = _set_key(s)
-                set_tiles[key].append((s.overlap_coeff, r.tile_x, r.tile_y))
-        
-        return pair_tiles, set_tiles
-    
-    def _apply_global_filters(
-        self,
-        result: OverlapTileResult,
-        pair_tile_counts: Dict[Tuple, int],
-        set_tile_counts: Dict[Tuple, int],
-        pair_best_tiles: Dict[Tuple, List[Tuple[float, int, int]]],
-        set_best_tiles: Dict[Tuple, List[Tuple[float, int, int]]],
-        total_tiles: int,
-    ) -> OverlapTileResult:
-        cfg = self.config
-        
-        min_tiles = cfg.min_tiles_present
-        if cfg.min_tiles_percent > 0:
-            min_tiles = max(min_tiles, int(total_tiles * cfg.min_tiles_percent))
-        
-        filtered_pairs = []
-        for p in result.pairs:
-            key = _pair_key(p)
+        with ProcessPoolExecutor(max_workers=cfg.n_workers) as executor:
+            futures = {executor.submit(_filter_single_file, args): args[0] for args in args_list}
             
-            if pair_tile_counts.get(key, 0) < min_tiles:
-                continue
-            
-            if cfg.top_k_tiles is not None or cfg.top_k_percent is not None:
-                tiles_for_combo = pair_best_tiles.get(key, [])
-                n_tiles = len(tiles_for_combo)
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
                 
-                if cfg.top_k_tiles is not None:
-                    k = cfg.top_k_tiles
-                elif cfg.top_k_percent is not None:
-                    k = max(1, int(n_tiles * cfg.top_k_percent))
-                else:
-                    k = n_tiles
+                self.stats.pairs_before += result['pairs_before']
+                self.stats.pairs_after += result['pairs_after']
+                self.stats.sets_before += result['sets_before']
+                self.stats.sets_after += result['sets_after']
                 
-                # Get top K tiles for this combination
-                top_k_tiles = heapq.nlargest(k, tiles_for_combo, key=lambda x: x[0])
-                top_k_coords = {(t[1], t[2]) for t in top_k_tiles}
+                out_path = output_dir / Path(result['filepath']).name
+                _save_checkpoint_raw(out_path, result['data'])
                 
-                if (result.tile_x, result.tile_y) not in top_k_coords:
-                    continue
-            
-            filtered_pairs.append(p)
+                completed += 1
+                if completed % 500 == 0:
+                    print(f"  [{completed}/{n_files}] files filtered...")
         
-        filtered_sets = []
-        for s in result.sets:
-            key = _set_key(s)
-            
-            # minimum tiles present
-            if set_tile_counts.get(key, 0) < min_tiles:
-                continue
-            
-            # top-K filtering
-            if cfg.top_k_tiles is not None or cfg.top_k_percent is not None:
-                tiles_for_combo = set_best_tiles.get(key, [])
-                n_tiles = len(tiles_for_combo)
-                
-                if cfg.top_k_tiles is not None:
-                    k = cfg.top_k_tiles
-                elif cfg.top_k_percent is not None:
-                    k = max(1, int(n_tiles * cfg.top_k_percent))
-                else:
-                    k = n_tiles
-                
-                top_k_tiles = heapq.nlargest(k, tiles_for_combo, key=lambda x: x[0])
-                top_k_coords = {(t[1], t[2]) for t in top_k_tiles}
-                
-                if (result.tile_x, result.tile_y) not in top_k_coords:
-                    continue
-            
-            filtered_sets.append(s)
+        print(f"  [{n_files}/{n_files}] Pass 2 complete")
+        print(f"\n[StreamingFilter] Done!")
+        print(self.stats)
+        print(f"\nFiltered checkpoints saved to: {output_dir}")
         
-        return OverlapTileResult(
-            tile_x=result.tile_x,
-            tile_y=result.tile_y,
-            tile_z=result.tile_z,
-            tile_shape=result.tile_shape,
-            total_voxels=result.total_voxels,
-            radii_um=result.radii_um,
-            marker_vox=result.marker_vox,
-            channel_stats=result.channel_stats,
-            pairs=filtered_pairs,
-            sets=filtered_sets,
-            n_active_channels=result.n_active_channels,
-            n_frequent_pairs=result.n_frequent_pairs,
-        )
-
+        return self.stats
 
 def filter_and_aggregate(
     checkpoint_dir: Path,
+    output_checkpoint_dir: Path,
     filter_config: FilterConfig,
-    pipeline_config, 
+    pipeline_config,  
     channel_names: List[str],
-    save_filtered_checkpoints: bool = False,
 ) -> Path:
-    """
-    filter, aggregate and write results to .bioset file.
-    Args:
-        checkpoint_dir: Directory with tile checkpoints
-        filter_config: Filtering configuration
-        pipeline_config: Pipeline configuration (for output paths, hierarchy, etc.)
-        channel_names: List of channel names
-        save_filtered_checkpoints: If True, save filtered checkpoints
-        
-    Returns:
-        Path to output .bioset file
-    """
+  
     from .aggregation import HierarchicalAggregator
     from .writer import BiosetWriter
+    from .checkpoint import load_all_checkpoints
     
-    filterer = TileFilter(filter_config)
-    
-    filtered_checkpoint_dir = None
-    if save_filtered_checkpoints:
-        filtered_checkpoint_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}_filtered"
-    
-    filtered_results = filterer.filter_checkpoints(
-        checkpoint_dir,
-        output_dir=filtered_checkpoint_dir,
+    filterer = StreamingFilter(filter_config)
+    filterer.filter_checkpoints(
+        input_dir=checkpoint_dir,
+        output_dir=output_checkpoint_dir,
     )
     
-    if not filtered_results:
+    print("\n[Aggregation] Loading filtered checkpoints...")
+    results = load_all_checkpoints(output_checkpoint_dir)
+    print(f"  Loaded {len(results)} tiles")
+    
+    if not results:
         raise RuntimeError("No results after filtering!")
     
-    first = filtered_results[0]
+    first = results[0]
     z = first.tile_shape[0]
-    max_y = max(r.tile_y for r in filtered_results) + 1
-    max_x = max(r.tile_x for r in filtered_results) + 1
+    max_y = max(r.tile_y for r in results) + 1
+    max_x = max(r.tile_x for r in results) + 1
     tile_y, tile_x = pipeline_config.tile_xy
     y = max_y * tile_y
     x = max_x * tile_x
     
-    print("[Filter] Aggregating filtered results...")
+    print("[Aggregation] Building hierarchy...")
     aggregator = HierarchicalAggregator(
         base_tile_y=tile_y,
         base_tile_x=tile_x,
         n_levels=pipeline_config.hierarchy_levels,
     )
     
-    for result in filtered_results:
+    for result in results:
         aggregator.add_tile_result(result)
     
+    print("[Aggregation] Computing aggregation...")
     levels = aggregator.aggregate()
     
     hierarchy_meta = []
@@ -432,7 +451,7 @@ def filter_and_aggregate(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{pipeline_config.output_name}_filtered.bioset"
     
-    print(f"[Filter] Writing to {output_path}...")
+    print(f"[Aggregation] Writing to {output_path}...")
     
     writer = BiosetWriter(
         output_path=output_path,
@@ -447,6 +466,6 @@ def filter_and_aggregate(
         writer.write_hierarchy_level(level)
     
     final_path = writer.finalize()
-    print(f"[Filter] Complete! Output: {final_path}")
+    print(f"\n[Complete] Output: {final_path}")
     
     return final_path
