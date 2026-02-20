@@ -36,7 +36,7 @@ pip install -e .
 ### Dependencies
 
 ```
-cupy-cuda12x
+cupy
 numpy
 scipy
 zarr
